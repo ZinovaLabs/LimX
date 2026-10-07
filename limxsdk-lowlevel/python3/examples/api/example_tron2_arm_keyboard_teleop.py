@@ -36,17 +36,30 @@ Keys (focus must be on this terminal):
     ] / [     : open / close the selected gripper(s) by one step
     q, Ctrl+C : release take-over and quit
 
+Record / replay:
+    --record FILE   save every published frame (virtual controller positions,
+                    take-over, X/A, gripper opening, measured ee) to FILE (JSON)
+                    when the script exits
+    --replay FILE   play a recording back instead of reading move keys; it sends
+                    the same stream with the same timing. Keys during replay:
+                        s       start
+                        space   pause / resume (holds the current pose)
+                        q       abort: release take-over and quit
+    --speed S       replay speed factor (default 1.0; use < 1 to slow down)
+
 The VR frame is z-up (head-set height ~1.6 m in the probe); how its x/y map onto the
 robot is decided by the tele-operation node. Start with small steps and watch the
 "ee" read-out to learn the mapping.
 
 Usage:
     python3 example_tron2_arm_keyboard_teleop.py [robot_ip] [--topic /sdk_vr_cmd | /vr_cmd]
+                                                 [--record FILE | --replay FILE [--speed S]]
 
 © [2025] LimX Dynamics Technology Co., Ltd. All rights reserved.
 """
 
 import argparse
+import json
 import select
 from array import array
 import sys
@@ -99,7 +112,27 @@ def main():
     parser.add_argument("robot_ip", nargs="?", default="10.192.1.2")
     parser.add_argument("--topic", default="/sdk_vr_cmd",
                         help="VR input topic to publish: /sdk_vr_cmd (default) or /vr_cmd")
+    parser.add_argument("--record", metavar="FILE", help="save the session to FILE on exit")
+    parser.add_argument("--replay", metavar="FILE", help="play back a recorded session")
+    parser.add_argument("--speed", type=float, default=1.0, help="replay speed factor")
     args = parser.parse_args()
+    if args.record and args.replay:
+        parser.error("use --record or --replay, not both")
+    if args.speed <= 0.0:
+        parser.error("--speed must be > 0")
+
+    frames = None
+    if args.replay:
+        with open(args.replay) as f:
+            frames = json.load(f)["frames"]
+        if not frames:
+            print("ERROR: {} has no frames.".format(args.replay))
+            sys.exit(1)
+        if frames[0]["takeover"]:
+            print("ERROR: the recording starts in take-over; refusing to replay it.")
+            sys.exit(1)
+        print("Loaded {} frames ({:.1f} s) from {}".format(len(frames), frames[-1]["t"], args.replay))
+    record = [] if args.record else None
     robot_ip = args.robot_ip
     own_vr = args.topic == "/vr_cmd"   # our own frames then show up on the /vr_cmd subscription
 
@@ -199,6 +232,11 @@ def main():
     print(__doc__.split("Usage:")[0])
 
     sel_name, sel_idx = SELECTIONS["b"]
+    replay_started = False
+    replay_paused = False
+    replay_clock = 0.0
+    replay_i = 0
+    rec_t0 = None
     stream_period = 1.0 / STREAM_HZ
     next_display = 0.0
     last = time.monotonic()
@@ -210,10 +248,22 @@ def main():
         while True:
             if select.select([sys.stdin], [], [], stream_period)[0]:
                 key = sys.stdin.read(1)
-                if key in "et" or key in MOVE_KEYS:
+                if frames is not None:
+                    if key == "q":
+                        return
+                    elif key == "s" and not replay_started:
+                        replay_started = True
+                        log("replay started")
+                    elif key == " " and replay_started:
+                        replay_paused = not replay_paused
+                        log("replay paused" if replay_paused else "replay resumed")
+                    key = ""
+                if key and (key in "et" or key in MOVE_KEYS):
                     log("key '{}'  takeover_cmd={}".format(key, not takeover if key == "t" else takeover))
                 if key == "q":
                     return
+                elif not key:
+                    pass
                 elif key in SELECTIONS:
                     sel_name, sel_idx = SELECTIONS[key]
                 elif key == "e":
@@ -254,11 +304,40 @@ def main():
 
             now = time.monotonic()
             dt, last = now - last, now
-            max_move = MAX_SPEED * dt
-            for i in range(2):
-                for k in range(3):
-                    current[i][k] += clamp(target[i][k] - current[i][k], -max_move, max_move)
+            if frames is not None and replay_started and not replay_paused:
+                replay_clock += dt * args.speed
+                while replay_i + 1 < len(frames) and frames[replay_i + 1]["t"] <= replay_clock:
+                    replay_i += 1
+                fr = frames[replay_i]
+                if fr["takeover"] and not takeover:
+                    origin = [list(fr["l"]), list(fr["r"])]
+                takeover = fr["takeover"]
+                buttons_until = now + 1.0 if fr["buttons"] else 0.0
+                current = [list(fr["l"]), list(fr["r"])]
+                target = [list(p) for p in current]
+                if fr["opening"] != opening:
+                    opening = list(fr["opening"])
+                    send_gripper()
+                if replay_i == len(frames) - 1:
+                    log("replay finished")
+                    return
+            elif frames is not None:
+                buttons_until = 0.0     # paused / not started: hold pose, no button presses
+            else:
+                max_move = MAX_SPEED * dt
+                for i in range(2):
+                    for k in range(3):
+                        current[i][k] += clamp(target[i][k] - current[i][k], -max_move, max_move)
             send_vr(now)
+            if record is not None:
+                if rec_t0 is None:
+                    rec_t0 = now
+                record.append({"t": round(now - rec_t0, 4), "takeover": takeover,
+                               "buttons": now < buttons_until,
+                               "l": [round(v, 5) for v in current[0]],
+                               "r": [round(v, 5) for v in current[1]],
+                               "opening": list(opening),
+                               "ee": fb["ee"]})
 
             while fb["events"]:
                 sys.stdout.write("\r\033[K" + fb["events"].pop(0) + "\n")
@@ -271,6 +350,12 @@ def main():
                        for i in range(2)]
                 node = {None: "?", True: "ON", False: "off"}[fb["takeover"]]
                 headset = " HEADSET!" if not own_vr and now - fb["headset_t"] < 1.0 else ""
+                if frames is not None:
+                    state = ("press 's' to start" if not replay_started else
+                             "PAUSED" if replay_paused else "playing")
+                    sel_name = "{:.0f}%".format(100.0 * replay_i / max(1, len(frames) - 1))
+                    fb["teleop"] = "replay {} {:.1f}/{:.1f}s | {}".format(
+                        state, frames[replay_i]["t"], frames[-1]["t"], fb["teleop"].split(" | ")[-1])
                 sys.stdout.write("\r\033[K[{:5s}] step {:.3f} | takeover cmd {} node {} | off L{} R{} | "
                                  "grip L={:3.0f} R={:3.0f} | ee {} | {}{}".format(
                                      sel_name, STEPS[step_i], "ON " if takeover else "off", node,
@@ -286,8 +371,15 @@ def main():
             send_vr(time.monotonic())
             time.sleep(stream_period)
         vr_pub.close()
+        if record:
+            with open(args.record, "w") as f:
+                json.dump({"robot_ip": robot_ip, "topic": args.topic, "stream_hz": STREAM_HZ,
+                           "created": time.strftime("%Y-%m-%d %H:%M:%S"), "frames": record}, f)
+            print("\nSaved {} frames ({:.1f} s) to {}".format(len(record), record[-1]["t"], args.record))
         for s in subs:
             s.close()
+        while fb["events"]:
+            sys.stdout.write("\r\033[K" + fb["events"].pop(0) + "\n")
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
         print("\nExit.")
 
