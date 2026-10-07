@@ -29,8 +29,12 @@ Keys (focus must be on this terminal):
     w / s     : move selected controller(s) +x / -x  (VR frame)
     a / d     : move selected controller(s) +y / -y
     r / f     : move selected controller(s) +z / -z
-    = / -     : bigger / smaller step
+    u / m     : roll  selected controller(s) + / -  (about VR x)
+    i / k     : pitch selected controller(s) + / -  (about VR y)
+    j / l     : yaw   selected controller(s) + / -  (about VR z)
+    = / -     : bigger / smaller step (move and rotate together)
     h         : return selected controller(s) to the take-over start pose
+                (position and orientation)
     space     : stop (hold the current pose)
     o / c     : fully open / close the selected gripper(s)
     ] / [     : open / close the selected gripper(s) by one step
@@ -60,6 +64,7 @@ Usage:
 
 import argparse
 import json
+import math
 import select
 from array import array
 import sys
@@ -78,13 +83,17 @@ DISPLAY_HZ = 10.0
 STEPS = [0.005, 0.01, 0.02, 0.05]   # m per key press
 MAX_SPEED = 0.05               # m/s, published controller pose ramps toward the target
 MAX_OFFSET = 0.30              # m, per-axis limit from the take-over start pose
+ROT_STEPS_DEG = [2.0, 5.0, 10.0, 15.0]   # deg per key press, paired with STEPS
+MAX_ROT_SPEED = math.radians(30.0)       # rad/s, published orientation ramps toward the target
+MAX_ROT = math.radians(60.0)             # rad, per-axis limit from the take-over start pose
 BUTTON_PULSE_S = 0.3           # how long 'e' holds X + A
 
 # Virtual controller start poses (VR frame, metres), close to where the real
 # controllers sat in the probe. The node re-baselines on take-over, so only
 # motion relative to these matters.
 EYE_POS = [0.0, 0.0, 1.66]
-CTRL_START = [[0.25, 0.25, 1.0], [0.25, -0.25, 1.0]]   # [left, right]
+# Each controller is [x, y, z, roll, pitch, yaw] (m, rad), rotation R = Rz(yaw) Ry(pitch) Rx(roll).
+CTRL_START = [[0.25, 0.25, 1.0, 0.0, 0.0, 0.0], [0.25, -0.25, 1.0, 0.0, 0.0, 0.0]]   # [left, right]
 
 OPENING_STEP = 10.0
 OPENING_MAX = [100.0, 95.0]    # the SDK clamps the right finger to 95
@@ -92,7 +101,8 @@ GRIPPER_SPEED = 50.0
 GRIPPER_FORCE = 50.0
 
 SELECTIONS = {"1": ("left", [0]), "2": ("right", [1]), "b": ("both", [0, 1])}
-MOVE_KEYS = {"w": (0, +1), "s": (0, -1), "a": (1, +1), "d": (1, -1), "r": (2, +1), "f": (2, -1)}
+MOVE_KEYS = {"w": (0, +1), "s": (0, -1), "a": (1, +1), "d": (1, -1), "r": (2, +1), "f": (2, -1),
+             "u": (3, +1), "m": (3, -1), "i": (4, +1), "k": (4, -1), "j": (5, +1), "l": (5, -1)}
 
 
 def clamp(v, lo, hi):
@@ -100,11 +110,20 @@ def clamp(v, lo, hi):
 
 
 def pose16(p):
-    """Row-major 4x4 transform with identity rotation and translation p."""
-    return array("f", [1.0, 0.0, 0.0, p[0],
-            0.0, 1.0, 0.0, p[1],
-            0.0, 0.0, 1.0, p[2],
-            0.0, 0.0, 0.0, 1.0])
+    """Row-major 4x4 transform from [x, y, z] or [x, y, z, roll, pitch, yaw]."""
+    roll, pitch, yaw = (p[3], p[4], p[5]) if len(p) >= 6 else (0.0, 0.0, 0.0)
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return array("f", [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr, p[0],
+                       sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr, p[1],
+                       -sp, cp * sr, cp * cr, p[2],
+                       0.0, 0.0, 0.0, 1.0])
+
+
+def arm6(v):
+    """Pad an older 3-value recording frame to [x, y, z, roll, pitch, yaw]."""
+    return list(v) + [0.0] * (6 - len(v))
 
 
 def main():
@@ -277,9 +296,11 @@ def main():
                 elif key in MOVE_KEYS and takeover:
                     axis, sign = MOVE_KEYS[key]
                     for i in sel_idx:
-                        target[i][axis] = clamp(target[i][axis] + sign * STEPS[step_i],
-                                                origin[i][axis] - MAX_OFFSET,
-                                                origin[i][axis] + MAX_OFFSET)
+                        step, limit = ((STEPS[step_i], MAX_OFFSET) if axis < 3 else
+                                       (math.radians(ROT_STEPS_DEG[step_i]), MAX_ROT))
+                        target[i][axis] = clamp(target[i][axis] + sign * step,
+                                                origin[i][axis] - limit,
+                                                origin[i][axis] + limit)
                 elif key in MOVE_KEYS:
                     fb["teleop"] = "move ignored: press 'e' then 't' first"
                 elif key == "=":
@@ -310,10 +331,10 @@ def main():
                     replay_i += 1
                 fr = frames[replay_i]
                 if fr["takeover"] and not takeover:
-                    origin = [list(fr["l"]), list(fr["r"])]
+                    origin = [arm6(fr["l"]), arm6(fr["r"])]
                 takeover = fr["takeover"]
                 buttons_until = now + 1.0 if fr["buttons"] else 0.0
-                current = [list(fr["l"]), list(fr["r"])]
+                current = [arm6(fr["l"]), arm6(fr["r"])]
                 target = [list(p) for p in current]
                 if fr["opening"] != opening:
                     opening = list(fr["opening"])
@@ -324,9 +345,9 @@ def main():
             elif frames is not None:
                 buttons_until = 0.0     # paused / not started: hold pose, no button presses
             else:
-                max_move = MAX_SPEED * dt
                 for i in range(2):
-                    for k in range(3):
+                    for k in range(6):
+                        max_move = (MAX_SPEED if k < 3 else MAX_ROT_SPEED) * dt
                         current[i][k] += clamp(target[i][k] - current[i][k], -max_move, max_move)
             send_vr(now)
             if record is not None:
@@ -346,7 +367,9 @@ def main():
                 ee = fb["ee"]
                 ee_str = "n/a" if ee is None else "L({:+.3f},{:+.3f},{:+.3f}) R({:+.3f},{:+.3f},{:+.3f})".format(
                     *ee[0], *ee[1])
-                off = ["({:+.2f},{:+.2f},{:+.2f})".format(*[current[i][k] - origin[i][k] for k in range(3)])
+                off = ["({:+.2f},{:+.2f},{:+.2f} rpy {:+.0f},{:+.0f},{:+.0f})".format(
+                    *[current[i][k] - origin[i][k] for k in range(3)],
+                    *[math.degrees(current[i][k] - origin[i][k]) for k in range(3, 6)])
                        for i in range(2)]
                 node = {None: "?", True: "ON", False: "off"}[fb["takeover"]]
                 headset = " HEADSET!" if not own_vr and now - fb["headset_t"] < 1.0 else ""
@@ -356,9 +379,9 @@ def main():
                     sel_name = "{:.0f}%".format(100.0 * replay_i / max(1, len(frames) - 1))
                     fb["teleop"] = "replay {} {:.1f}/{:.1f}s | {}".format(
                         state, frames[replay_i]["t"], frames[-1]["t"], fb["teleop"].split(" | ")[-1])
-                sys.stdout.write("\r\033[K[{:5s}] step {:.3f} | takeover cmd {} node {} | off L{} R{} | "
+                sys.stdout.write("\r\033[K[{:5s}] step {} | takeover cmd {} node {} | off L{} R{} | "
                                  "grip L={:3.0f} R={:3.0f} | ee {} | {}{}".format(
-                                     sel_name, STEPS[step_i], "ON " if takeover else "off", node,
+                                     sel_name, "{:.3f}/{:.0f}deg".format(STEPS[step_i], ROT_STEPS_DEG[step_i]), "ON " if takeover else "off", node,
                                      off[0], off[1], opening[0], opening[1], ee_str, fb["teleop"], headset))
                 sys.stdout.flush()
     except KeyboardInterrupt:
