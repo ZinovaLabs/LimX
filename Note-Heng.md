@@ -42,3 +42,48 @@ Things to know
 - If your Tron2 has legs, the base keys won't make it walk. This SDK's walking-level interface is publishRobotCmd, which sends raw joint position and torque targets. That takes over the motors from the robot's built-in controller, so walking would need your own balance controller. Don't send that to a real robot until it works in the Gazebo simulator (127.0.0.1) and the robot is on a hoist or stand.
 - The script reads keys from the terminal, so the terminal must have focus. Over SSH it works as is.
 - Keep the robot's physical e-stop and the remote control within reach the first time. Make sure nothing else, like the remote or the VR teleop, is controlling the robot at the same time. Otherwise the robot may ignore your commands or the two will fight over it.
+
+
+
+
+
+
+
+##########
+I wrote a probe script, python3/examples/api/example_tron2_ee_probe.py, that collects everything into one file. It only reads from the robot and never sends commands, so it's safe to run. It passes a syntax check and the SDK fields it uses exist, but I couldn't run it against a robot: 10.192.1.2 doesn't answer from this machine.
+
+Steps
+
+1. Connect your PC to the robot. Use the same network setup as before (PC on 10.192.1.x), then check it responds:
+ping 10.192.1.2
+
+2. Get the robot ready for VR teleop. Power it on with the arms enabled, the way you normally would before using the headset.
+
+3. Start the probe (it records for 60 seconds):
+cd /home/heng/work/LimX/limxsdk-lowlevel
+python3 python3/examples/api/example_tron2_ee_probe.py 10.192.1.2 --duration 60
+It first lists all topics on the robot, then starts recording.
+
+4. While it records, have someone use the VR controllers and do these moves slowly:
+- Hold grip on the right controller, then move it about 10 cm forward and back, then left and right, then up and down.
+- Release grip, move the controller somewhere else, grip again, and move it a little. This shows whether grip works as a clutch.
+- Press the trigger once.
+- Do the same with the left controller if there's time.
+
+The status line shows a count for each recorded stream, e.g. {'vr_cmd': 412, 'ee_pose': 380, ...}. If vr_cmd stays at 0, the VR stream isn't reaching your PC.
+
+5. Send me the result. The script saves tron2_probe_<date>_<time>.json in the folder you ran it from.
+- If you ran it on this PC, just tell me the file name and I'll read it myself.
+- If you ran it on another PC, copy the file here. Pasting it into chat won't work well because it's probably large.
+
+No VR headset?
+
+Still run step 3 without moving anything (--duration 10 is enough). The topic list alone tells me whether there's a separate topic for commanding the end-effector directly.
+
+What I'll get from the file
+
+- Which topic actually commands the end-effector.
+- Whether controller positions are absolute or relative to where you pressed grip.
+- Which coordinate frame and units they use, by comparing controller motion with how the arm moved.
+
+With that, I can add arm movement keys to example_tron2_arm_keyboard_teleop.py without guessing.
