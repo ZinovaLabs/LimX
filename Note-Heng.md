@@ -44,6 +44,30 @@ Things to know
 - Keep the robot's physical e-stop and the remote control within reach the first time. Make sure nothing else, like the remote or the VR teleop, is controlling the robot at the same time. Otherwise the robot may ignore your commands or the two will fight over it.
 
 
+Keys:
+
+┌─────────────────┬──────────────────────────────────────────────────┐
+│       Key       │                      Action                      │
+├─────────────────┼──────────────────────────────────────────────────┤
+│ 1 / 2 / b       │ Select left / right / both (arms and grippers)   │
+├─────────────────┼──────────────────────────────────────────────────┤
+│ e               │ Turn teleop on (presses X + A)                   │
+├─────────────────┼──────────────────────────────────────────────────┤
+│ t               │ Start / stop arm control                         │
+├─────────────────┼──────────────────────────────────────────────────┤
+│ w s / a d / r f │ Move ±x / ±y / ±z                                │
+├─────────────────┼──────────────────────────────────────────────────┤
+│ = / -           │ Bigger / smaller step (5 mm, 1 cm, 2 cm or 5 cm) │
+├─────────────────┼──────────────────────────────────────────────────┤
+│ h               │ Return to where arm control started              │
+├─────────────────┼──────────────────────────────────────────────────┤
+│ space           │ Stop and hold the current position               │
+├─────────────────┼──────────────────────────────────────────────────┤
+│ o c [ ]         │ Gripper open / close / step, as before           │
+├─────────────────┼──────────────────────────────────────────────────┤
+│ q               │ Quit (releases arm control first)                │
+└─────────────────┴──────────────────────────────────────────────────┘
+
 
 
 
@@ -54,7 +78,7 @@ I wrote a probe script, python3/examples/api/example_tron2_ee_probe.py, that col
 
 Steps
 
-1. Connect your PC to the robot. Use the same network setup as before (PC on 10.192.1.x), then check it responds:
+1. Connect your PC to the robot. Use the same network setup as before (PC on 10.192.1.120), then check it responds:
 ping 10.192.1.2
 
 2. Get the robot ready for VR teleop. Power it on with the arms enabled, the way you normally would before using the headset.
