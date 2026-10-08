@@ -97,15 +97,16 @@ def check_streams(robot, camera, cams, seconds, frequency):
 
     Returns (ok, delay, slowest): ok is False when a stream sends nothing or is slower than
     `frequency`; delay is how far behind real time frames must be assembled so that every
-    stream's samples around a frame time have arrived; slowest is the lowest stream rate."""
+    stream's samples around a frame time have arrived; slowest is the lowest stream rate
+    (None when a stream sends nothing)."""
     time.sleep(seconds)
     now = time.monotonic()
     window = max(1.0, seconds - 1.0)      # the first second only settles the clock mapping
-    ok, delay, slowest, published = True, 0.0, None, None
+    ok, delay, slowest, published, missing = True, 0.0, None, None, False
     for name, stream in [("state", robot.streams["state"])] + [(c, camera.streams[c]) for c in cams]:
         stats, last = stream.stats(window), stream.latest()
         if stats is None or now - last[3] > 0.5:
-            ok = False
+            ok, missing = False, True
             tried = getattr(camera, "topics", {}).get(name)
             print("  {:16s} NO {}{}".format(name, "IMAGES" if name in cams else "JOINT STATE",
                                             "  (tried {})".format(", ".join(tried)) if tried else ""))
@@ -128,7 +129,7 @@ def check_streams(robot, camera, cams, seconds, frequency):
         ok = ok and not slow
         print("  {:16s} {:6.1f} Hz  latency {:3.0f} ms{}{}".format(
             name, rate, latency * 1000, info, "  SLOWER THAN --frequency {:g}".format(frequency) if slow else ""))
-    return ok, min(1.0, max(0.05, delay + 0.02)), slowest
+    return ok, min(1.0, max(0.05, delay + 0.02)), None if missing else slowest
 
 
 def slug(text):
@@ -312,9 +313,15 @@ def aligned_frame(robot, camera, cams, t, tick, period, gripper_fill):
     cmd = robot.streams["cmd"].nearest(t)
     if cmd is not None and (abs(cmd[0] - t) > tol or not any(cmd[2][1][i] > 0 for i in range(14))):
         cmd = None
-    grip = robot.streams["gripper"].nearest(t)
-    if grip is not None and (abs(grip[0] - t) > max(tol, GRIPPER_TOL_S) or len(grip[2]) < 2):
-        grip = None
+    # gripper: the measured opening, else (feedback missing) the last commanded one, which holds
+    gcmd = robot.streams["gripper_cmd"].before(t)
+    grip, gsrc = robot.streams["gripper"].nearest(t), "state"
+    if grip is None or abs(grip[0] - t) > max(tol, GRIPPER_TOL_S) or len(grip[2]) < 2:
+        grip, gsrc = gcmd, "cmd"
+        if grip is not None and len(grip[2]) < 2:
+            grip = None
+    if grip is None:
+        gsrc = "fill"
     gopen = ([min(1.0, max(0.0, v / 100.0)) for v in grip[2][:2]] if grip is not None
              else [gripper_fill, gripper_fill])
     row = {
@@ -323,6 +330,8 @@ def aligned_frame(robot, camera, cams, t, tick, period, gripper_fill):
         "cmd_q": [round(v, 6) for v in cmd[2][0]] if cmd is not None else None,
         "q": q, "dq": dq, "tau": tau,
         "gripper_raw": grip[2] if grip is not None else None,
+        "gripper_src": gsrc,
+        "gripper_cmd": gcmd[2] if gcmd is not None else None,
         "sync_ms": {n: round((p[0] - t) * 1000.0, 1) for n, p in picks.items()},
         "img_seq": {c: picks[c][1] for c in cams},
         "fresh": all(abs(p[0] - t) <= tol for p in picks.values()),
@@ -354,7 +363,8 @@ def main():
     parser.add_argument("--preview-height", type=int, default=200, metavar="PX",
                         help="camera tile height the preview window opens with (drag to resize)")
     parser.add_argument("--gripper-fill", type=float, default=0.0,
-                        help="gripper value (0..1) recorded when no gripper state is published")
+                        help="gripper value (0..1, 0 closed) recorded when neither the gripper state "
+                             "nor a gripper command has been received")
     args = parser.parse_args()
     if not args.check and not args.task:
         parser.error("--task is required (or use --check)")
@@ -385,12 +395,13 @@ def main():
         camera = RealSenseCameraSource(mapping, fps=int(args.frequency))
         cams = list(mapping.values())
         sources_desc = {"cameras": "realsense", "serials": mapping}
-    sources_desc["state"] = "sdk RobotState (motors 0-13), GripperState"
+    sources_desc["state"] = ("sdk RobotState (motors 0-13); gripper: /limx/2F-gripper/state opening, "
+                             "else last /limx/2F-gripper/cmd opening")
 
     print("Checking streams ({:.0f} s) ...".format(3.0))
     streams_ok, delay, slowest = check_streams(robot, camera, cams, 3.0, args.frequency)
     if slowest:
-        print("  all streams keep up with --frequency up to {:.0f} Hz".format(slowest / 0.95 // 1))
+        print("  the slowest stream runs at {:.0f} Hz: the highest --frequency to record all of them".format(slowest))
     if args.check:
         camera.close()
         sys.exit(0 if streams_ok else 1)
@@ -549,7 +560,7 @@ def main():
                     preview.recording = episode is not None
                 sys.stdout.write("\r\033[K{} | state {} | cam {} | ctrl cmd {} | grip {} | {}".format(
                     rec, "ok" if state_ok else "STALE", cam_str, "yes" if cmd_ok else "no",
-                    "ok" if grip is not None else "n/a", note))
+                    "{:.0f}/{:.0f}%".format(*grip[2][:2]) if grip is not None else "n/a", note))
                 sys.stdout.flush()
             time.sleep(0.002)
     except KeyboardInterrupt:

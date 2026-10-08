@@ -36,6 +36,7 @@ import limxsdk.robot.Robot as Robot
 import limxsdk.robot.RobotType as RobotType
 import limxsdk.datatypes as datatypes
 from limxsdk.msg import Header
+from limxsdk.msg import controller_msgs
 
 ARM_JOINTS = ["proximal_pitch", "proximal_roll", "proximal_yaw", "elbow",
               "wrist_yaw", "wrist_pitch", "wrist_roll"]
@@ -165,6 +166,12 @@ class Stream(object):
         with self.lock:
             return self.samples[-1] if self.samples else None
 
+    def before(self, t):
+        """The last sample at or before t (for event streams whose value holds), or None."""
+        with self.lock:
+            i = bisect.bisect_right(self.samples, t, key=lambda s: s[0])
+            return self.samples[i - 1] if i else None
+
     def nearest(self, t):
         with self.lock:
             if not self.samples:
@@ -197,22 +204,31 @@ class Stream(object):
 class RobotSource(object):
     """Joint state, robot-controller command and gripper state as time-stamped Streams:
 
-        state    (q, dq, tau)
-        cmd      (q, Kp) from the robot's own controller (/motor/cmd)
-        gripper  [left, right] opening in percent
+        state        (q, dq, tau)
+        cmd          (q, Kp) from the robot's own controller (/motor/cmd)
+        gripper      [left, right] 2F-gripper opening in percent, 0 closed .. 100 open
+                     (/limx/2F-gripper/state, ~100 Hz)
+        gripper_cmd  [left, right] commanded opening in percent (/limx/2F-gripper/cmd,
+                     sent by VR teleop / the app only when the gripper is moved)
 
     Each is stamped in nanoseconds, but not on one common clock (/motor/cmd runs ~2 s ahead
-    of /motor/state), so every stream gets its own ClockMap."""
+    of /motor/state), so every stream gets its own ClockMap. The gripper state is published
+    as controller_msgs/JointState, which the SDK's subscribeGripperState does not receive,
+    so it is read with the generic subscriber. Gripper commands are timed by their receive
+    time and hold until the next one."""
 
     def __init__(self, ip):
         self.robot = Robot(RobotType.Tron2)
         if not self.robot.init(ip):
             raise RuntimeError("robot.init failed for {}".format(ip))
-        self.streams = {"state": Stream(), "cmd": Stream(), "gripper": Stream()}
+        self.streams = {"state": Stream(), "cmd": Stream(), "gripper": Stream(),
+                        "gripper_cmd": Stream(keep=float("inf"))}   # holds: keep every command
         self.clocks = {name: ClockMap() for name in self.streams}
         self.robot.subscribeRobotState(self._on_state)
         self.robot.subscribeRobotCmd(self._on_cmd)
-        self.robot.subscribeGripperState(self._on_gripper)
+        self.gripper_sub = self.robot.subscribe(controller_msgs.JointState, "/limx/2F-gripper/state",
+                                                self._on_gripper)
+        self.robot.subscribeGripperCmd(self._on_gripper_cmd)
 
     def _add(self, name, stamp_ns, value):
         recv = time.monotonic()
@@ -225,7 +241,11 @@ class RobotSource(object):
         self._add("cmd", c.stamp, (list(c.q), list(c.Kp)))
 
     def _on_gripper(self, g):
-        self._add("gripper", g.stamp, list(g.q))
+        self._add("gripper", g.header.stamp.to_nsec(), list(g.q))
+
+    def _on_gripper_cmd(self, c):
+        recv = time.monotonic()
+        self.streams["gripper_cmd"].add(recv, list(c.opening), recv)
 
 
 # ----------------------------------------------------------------------------- cameras

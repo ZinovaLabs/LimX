@@ -58,6 +58,14 @@ Every frame is a synchronised observation of all streams at one instant:
 - `meta.json` stores `frequency`, the alignment settings (`align`) and the counts of stale,
   skipped and repeated-image frames.
 
+Gripper: the value is the measured opening on `/limx/2F-gripper/state` (percent, 0 closed ..
+100 open, scaled to 0..1, ~100 Hz, aligned like the other streams). It is read with the SDK's
+generic subscriber, since the robot publishes it as `controller_msgs/JointState`, which
+`subscribeGripperState` does not receive. If that topic stops, the last command on
+`/limx/2F-gripper/cmd` is used (it holds until the next), and with neither, `--gripper-fill`.
+Each frame records `gripper_src` (`state`, `cmd` or `fill`), `gripper_raw` and the last
+command `gripper_cmd`; the status line shows `grip L/R%`.
+
 On the robot, the left wrist camera currently streams at 10 Hz (in a dim scene its
 auto-exposure lowers the frame rate), so all three cameras record only with `--frequency 10`
 until that is fixed; `--cam cam_high --cam cam_right_wrist` records the other two at 30 Hz.
