@@ -19,7 +19,8 @@ access follows LimX's [`tron2_env`](https://github.com/limxdynamics/tron2_env).
   yaw, elbow, wrist yaw, pitch, roll). Gripper = opening 0..1.
 - **cameras**, all three recorded in every frame: `cam_high` (head camera), `cam_left_wrist`
   and `cam_right_wrist` (the cameras on the left and right end-effectors).
-- **rate**: 30 Hz, the tron2_openpi policy rate.
+- **rate**: one rate for every stream, `--frequency` (default 30 Hz, the tron2_openpi policy
+  rate), with all streams time-aligned in each frame (see *Synchronisation* below).
 - **task**: the natural-language instruction, stored per episode.
 
 ## 1. Record
@@ -29,13 +30,37 @@ Operate the arms however you like (VR teleop, drag-teach, keyboard); the collect
 ```
 source ~/limx-venv/bin/activate
 cd /home/alfredo/Documents/Zinova/LimX
-python3 vla/collect_vla_data.py --check      # all three cameras must show a rate and resolution
+python3 vla/collect_vla_data.py --check      # every stream must show a rate of at least --frequency
 python3 vla/collect_vla_data.py --task "pick up the cup and place it on the plate"
+python3 vla/collect_vla_data.py --task "..." --frequency 10    # record every stream at 10 Hz
 ```
 
-`--check` prints, per camera, the rate, the resolution and the topic it found, then exits.
-The collector runs the same check at start-up. A camera showing `NO IMAGES` lists the topics
-it tried; give the right one with `--topic cam_left_wrist=/camera/...` (repeat per camera).
+`--check` prints, for the joint state and each camera, the rate and latency (cameras also the
+resolution and topic), and the highest `--frequency` all streams keep up with, then exits.
+The collector runs the same check at start-up and refuses to start when a stream is slower
+than `--frequency` (`SLOWER THAN --frequency`): either fix that stream or lower
+`--frequency`. A camera showing `NO IMAGES` lists the topics it tried; give the right one with
+`--topic cam_left_wrist=/camera/...` (repeat per camera). `--fps` still works as an alias.
+
+### Synchronisation
+
+Every frame is a synchronised observation of all streams at one instant:
+
+- Each stream (joint state, controller command, gripper, each camera) is buffered with its
+  capture time: the sender's own timestamp, mapped onto this PC's clock (each sender clock
+  separately; the robot cameras share one).
+- Frame k is the observation at time `t0 + k / frequency`; every stream contributes its sample
+  nearest that time. Frames are assembled a short delay behind real time (measured at start-up
+  from the slowest stream, e.g. ~80 ms at 30 Hz), so the samples on both sides have arrived.
+- `frames.jsonl` stores, per frame, `t` (exactly `k / frequency`), `sync_ms` (each stream's
+  sample time minus the frame time) and `img_seq` (which image each camera contributed). A frame
+  is `fresh` when every `sync_ms` is within half a period.
+- `meta.json` stores `frequency`, the alignment settings (`align`) and the counts of stale,
+  skipped and repeated-image frames.
+
+On the robot, the left wrist camera currently streams at 10 Hz (in a dim scene its
+auto-exposure lowers the frame rate), so all three cameras record only with `--frequency 10`
+until that is fixed; `--cam cam_high --cam cam_right_wrist` records the other two at 30 Hz.
 
 | Key | Action |
 |---|---|
@@ -48,13 +73,15 @@ it tried; give the right one with `--topic cam_left_wrist=/camera/...` (repeat p
 | `t` | type a new task instruction for the next episodes |
 | `q` | quit (an episode in progress is kept as "incomplete") |
 
-The status line shows the state, every camera's image age, whether the robot controller's
+The status line shows the recording rate, the worst `sync_ms` of the last 0.2 s, the state,
+every camera's image age, whether the robot controller's
 joint targets are present (`ctrl cmd yes` during VR teleop), and the gripper. An episode only
 starts when the joint state and all three cameras are fresh, so every saved frame has a
 head, left-wrist and right-wrist image.
 
 A small window shows all cameras side by side while collecting (needs `pip install
-opencv-python`; `--no-preview` turns it off). Each camera is labelled with its image age and
+opencv-python`; `--no-preview` turns it off). Drag the window edges to resize it;
+`--preview-height 300` sets the size it opens with (camera tile height in pixels). Each camera is labelled with its image age and
 rate, in red when stale, and the bar on top turns red while an episode records. The keys
 above also work with the window focused; closing the window does not stop the collector.
 

@@ -25,6 +25,8 @@ cam_right_wrist, as in tron2_openpi):
 Everything here only reads from the robot.
 """
 
+import bisect
+import collections
 import io
 import struct
 import threading
@@ -101,49 +103,150 @@ class CompressedImage(object):
         return self, o + n
 
 
+# ----------------------------------------------------------------------------- time alignment
+
+class ClockMap(object):
+    """Maps one sender's timestamps (seconds, any epoch) onto this PC's time.monotonic().
+
+    The offset is the smallest (receive time - stamp) over the last `window` seconds, i.e.
+    that of the sample that came through fastest, so a mapped time is the capture time plus
+    only the minimum transport delay. The window lets a bogus stamp age out (the SDK
+    delivers a couple of state messages stamped ~2 s ahead right after connecting).
+    Streams stamped by the same clock share one ClockMap, which keeps their relative timing
+    exact (a camera with a longer pipeline stays later)."""
+
+    def __init__(self, window=1.0):
+        self.lock = threading.Lock()
+        self.window = window
+        self.mins = collections.deque()           # (recv, recv - stamp), increasing offsets
+
+    @property
+    def offset(self):
+        with self.lock:
+            return self.mins[0][1] if self.mins else None
+
+    def __call__(self, stamp, recv):
+        if not stamp:                              # sender left the stamp empty
+            return recv
+        with self.lock:
+            d = recv - stamp
+            while self.mins and self.mins[-1][1] >= d:
+                self.mins.pop()
+            self.mins.append((recv, d))
+            while self.mins[0][0] < recv - self.window:
+                self.mins.popleft()
+            return stamp + self.mins[0][1]
+
+
+class Stream(object):
+    """Samples of one modality as (t, seq, value, recv), oldest first, kept for `keep` s.
+
+    t is the capture time on time.monotonic() (from ClockMap), recv the receive time,
+    seq counts samples. nearest(t) gives the sample closest to t, for aligned reads."""
+
+    def __init__(self, keep=2.0):
+        self.lock = threading.Lock()
+        self.samples = collections.deque()
+        self.seq = 0
+        self.keep = keep
+
+    def add(self, t, value, recv):
+        with self.lock:
+            self.seq += 1
+            sample = (t, self.seq, value, recv)
+            if not self.samples or t >= self.samples[-1][0]:
+                self.samples.append(sample)
+            else:                                  # out of order (clock offset moved): keep sorted
+                self.samples.insert(bisect.bisect_right(self.samples, t, key=lambda s: s[0]), sample)
+            while self.samples[0][0] < self.samples[-1][0] - self.keep:
+                self.samples.popleft()
+
+    def latest(self):
+        with self.lock:
+            return self.samples[-1] if self.samples else None
+
+    def nearest(self, t):
+        with self.lock:
+            if not self.samples:
+                return None
+            i = bisect.bisect_left(self.samples, t, key=lambda s: s[0])
+            if i == len(self.samples):
+                return self.samples[-1]
+            if i > 0 and t - self.samples[i - 1][0] <= self.samples[i][0] - t:
+                return self.samples[i - 1]
+            return self.samples[i]
+
+    def stats(self, window):
+        """(rate Hz, largest capture-to-receive latency s, largest gap between samples s)
+        over the last `window` seconds, or None with fewer than two samples."""
+        with self.lock:
+            if not self.samples:
+                return None
+            end = self.samples[-1][0]
+            recent = [s for s in self.samples if s[0] >= end - window]
+        if len(recent) < 2:
+            return None
+        span = recent[-1][0] - recent[0][0]
+        return ((len(recent) - 1) / span if span > 0 else 0.0,
+                max(s[3] - s[0] for s in recent),
+                max(b[0] - a[0] for a, b in zip(recent, recent[1:])))
+
+
 # ----------------------------------------------------------------------------- robot state
 
 class RobotSource(object):
-    """Latest joint state, robot-controller command and gripper state, with receive times."""
+    """Joint state, robot-controller command and gripper state as time-stamped Streams:
+
+        state    (q, dq, tau)
+        cmd      (q, Kp) from the robot's own controller (/motor/cmd)
+        gripper  [left, right] opening in percent
+
+    Each is stamped in nanoseconds, but not on one common clock (/motor/cmd runs ~2 s ahead
+    of /motor/state), so every stream gets its own ClockMap."""
 
     def __init__(self, ip):
         self.robot = Robot(RobotType.Tron2)
         if not self.robot.init(ip):
             raise RuntimeError("robot.init failed for {}".format(ip))
-        self.lock = threading.Lock()
-        self.state = None        # (t, q, dq, tau)
-        self.cmd = None          # (t, q, Kp) from the robot's own controller (/motor/cmd)
-        self.gripper = None      # (t, [left, right] opening in percent)
+        self.streams = {"state": Stream(), "cmd": Stream(), "gripper": Stream()}
+        self.clocks = {name: ClockMap() for name in self.streams}
         self.robot.subscribeRobotState(self._on_state)
         self.robot.subscribeRobotCmd(self._on_cmd)
         self.robot.subscribeGripperState(self._on_gripper)
 
+    def _add(self, name, stamp_ns, value):
+        recv = time.monotonic()
+        self.streams[name].add(self.clocks[name](stamp_ns * 1e-9, recv), value, recv)
+
     def _on_state(self, s):
-        with self.lock:
-            self.state = (time.monotonic(), list(s.q), list(s.dq), list(s.tau))
+        self._add("state", s.stamp, (list(s.q), list(s.dq), list(s.tau)))
 
     def _on_cmd(self, c):
-        with self.lock:
-            self.cmd = (time.monotonic(), list(c.q), list(c.Kp))
+        self._add("cmd", c.stamp, (list(c.q), list(c.Kp)))
 
     def _on_gripper(self, g):
-        with self.lock:
-            self.gripper = (time.monotonic(), list(g.q))
-
-    def snapshot(self):
-        with self.lock:
-            return self.state, self.cmd, self.gripper
+        self._add("gripper", g.stamp, list(g.q))
 
 
 # ----------------------------------------------------------------------------- cameras
 
 class CameraSource(object):
-    """Common interface: latest(name) -> (jpeg_bytes, receive_time, seq) or None."""
+    """Common interface: one Stream of JPEG bytes per camera name in self.streams, and
+    latest(name) -> (jpeg_bytes, receive_time, seq) or None."""
 
     names = ()
 
+    def _init_streams(self, names):
+        self.names = tuple(names)
+        self.streams = {n: Stream() for n in self.names}
+
+    def _add(self, name, data, t=None, recv=None):
+        recv = time.monotonic() if recv is None else recv
+        self.streams[name].add(recv if t is None else t, data, recv)
+
     def latest(self, name):
-        raise NotImplementedError
+        s = self.streams[name].latest()
+        return (s[2], s[3], s[1]) if s else None
 
     def close(self):
         pass
@@ -158,24 +261,20 @@ class SdkCameraSource(CameraSource):
     def __init__(self, robot, topics):
         self.robot = robot
         self.lock = threading.Lock()
-        self.frames = {}
         self.topics = {n: [t] if isinstance(t, str) else list(t) for n, t in topics.items()}
         self.active = {}
-        self.names = tuple(self.topics)
+        self._init_streams(self.topics)
+        self.clock = ClockMap()          # all robot cameras are stamped by the same clock
         self.subs = []
         for name, candidates in self.topics.items():
             for topic in candidates:
                 def cb(msg, name=name, topic=topic):
+                    recv = time.monotonic()
                     with self.lock:
                         if self.active.setdefault(name, topic) != topic:
                             return
-                        seq = self.frames.get(name, (None, 0, 0))[2] + 1
-                        self.frames[name] = (msg.data, time.monotonic(), seq)
+                    self._add(name, msg.data, self.clock(msg.header.stamp.to_nsec() * 1e-9, recv), recv)
                 self.subs.append(robot.subscribe(CompressedImage, topic, cb))
-
-    def latest(self, name):
-        with self.lock:
-            return self.frames.get(name)
 
     def active_topic(self, name):
         with self.lock:
@@ -208,9 +307,7 @@ class BridgeCameraSource(CameraSource):
         self.provider = BridgeObservationProvider(BridgeConfig(
             host=host, ws_path=ws_path, image_max_fps=image_max_fps, verify_tls=verify_tls,
             save_debug_images=False))
-        self.names = CAMERA_NAMES
-        self.lock = threading.Lock()
-        self.frames = {}
+        self._init_streams(CAMERA_NAMES)
         self.running = True
         self.provider.start()
         self.thread = threading.Thread(target=self._loop, daemon=True)
@@ -228,14 +325,8 @@ class BridgeCameraSource(CameraSource):
                     continue
                 if img.ndim == 3 and img.shape[0] == 3 and img.shape[-1] != 3:
                     img = img.transpose(1, 2, 0)          # CHW -> HWC
-                data = _encode_jpeg(img)
-                with self.lock:
-                    seq = self.frames.get(name, (None, 0, 0))[2] + 1
-                    self.frames[name] = (data, now, seq)
-
-    def latest(self, name):
-        with self.lock:
-            return self.frames.get(name)
+                if name in self.streams:
+                    self._add(name, _encode_jpeg(img), recv=now)
 
     def close(self):
         self.running = False
@@ -254,9 +345,7 @@ class RealSenseCameraSource(CameraSource):
         self.manager = MultiCameraManager(serial_to_name=serial_to_name, camera_configs=configs)
         self.manager.setup_pipelines()
         self.manager.start_capture()
-        self.names = tuple(serial_to_name.values())
-        self.lock = threading.Lock()
-        self.frames = {}
+        self._init_streams(serial_to_name.values())
         self.running = True
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
@@ -268,16 +357,9 @@ class RealSenseCameraSource(CameraSource):
                 if not frame or frame.get("color") is None:
                     continue
                 got = True
-                data = _encode_jpeg(frame["color"][:, :, ::-1].copy())   # BGR -> RGB
-                with self.lock:
-                    seq = self.frames.get(name, (None, 0, 0))[2] + 1
-                    self.frames[name] = (data, time.monotonic(), seq)
+                self._add(name, _encode_jpeg(frame["color"][:, :, ::-1].copy()))   # BGR -> RGB
             if not got:
                 time.sleep(0.005)
-
-    def latest(self, name):
-        with self.lock:
-            return self.frames.get(name)
 
     def close(self):
         self.running = False
