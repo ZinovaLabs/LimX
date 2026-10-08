@@ -59,7 +59,6 @@ import threading
 import time
 import tty
 
-import limxsdk.robot.Rate as Rate
 import limxsdk.robot.Robot as Robot
 import limxsdk.robot.RobotType as RobotType
 import limxsdk.datatypes as datatypes
@@ -70,7 +69,37 @@ CMD_HZ = 500.0                 # replay command rate
 MAX_RAMP_SPEED = 0.2           # rad/s, move to the first recorded pose
 MIN_RAMP_TIME = 3.0            # s
 MAX_REPLAY_SPEED = 2.0         # rad/s, refuse to replay faster joint motion than this
-DEFAULT_JOINTS = r"arm|shoulder|elbow|wrist"
+DEFAULT_JOINTS = r"arm|shoulder|elbow|wrist|^motor_([0-9]|1[0-3])$"
+# The robot arm controller's own gains (read from /motor/cmd, 2026-10-07): motors 0-6 left
+# arm, 7-13 right arm, 14-15 head. Used for motors that are held but not replayed.
+TRON2_DEFAULT_KP = [420.0, 420.0, 400.0, 400.0, 300.0, 200.0, 150.0,
+                    420.0, 420.0, 400.0, 400.0, 300.0, 200.0, 150.0, 350.0, 550.0]
+TRON2_DEFAULT_KD = [12.0, 12.0, 15.0, 15.0, 10.0, 10.0, 10.0,
+                    12.0, 12.0, 15.0, 15.0, 10.0, 10.0, 10.0, 9.0, 9.0]
+
+
+def label_names(names, n):
+    """This firmware sends no motor names: label the joints motor_0 ... motor_<n-1>."""
+    names = list(names)
+    return names if any(names) else ["motor_{}".format(i) for i in range(n)]
+
+
+class Pacer(object):
+    """Fixed-rate loop timing in plain Python: sleeps at most one period, never blocks
+    longer, and re-synchronises after an overrun (used instead of the SDK's Rate)."""
+
+    def __init__(self, hz):
+        self.period = 1.0 / hz
+        self.next = time.monotonic() + self.period
+
+    def sleep(self):
+        now = time.monotonic()
+        wait = self.next - now
+        if wait > 0:
+            time.sleep(min(wait, self.period))
+            self.next += self.period
+        else:
+            self.next = now + self.period      # overrun: skip ahead instead of catching up
 
 
 class Feedback(object):
@@ -87,12 +116,12 @@ class Feedback(object):
 
     def on_state(self, s: datatypes.RobotState):
         with self.lock:
-            self.state = (list(s.motor_names), list(s.q), list(s.dq), list(s.tau))
+            self.state = (label_names(s.motor_names, len(s.q)), list(s.q), list(s.dq), list(s.tau))
             self.state_frames += 1
 
     def on_cmd(self, c: datatypes.RobotCmd):
         with self.lock:
-            self.cmd = {"names": list(c.motor_names), "q": list(c.q), "dq": list(c.dq),
+            self.cmd = {"names": label_names(c.motor_names, len(c.q)), "q": list(c.q), "dq": list(c.dq),
                         "tau": list(c.tau), "Kp": list(c.Kp), "Kd": list(c.Kd), "mode": list(c.mode)}
             self.cmd_frames += 1
 
@@ -252,6 +281,13 @@ def replay(args):
 
     fb = Feedback()
     robot, sub = connect(args.ip, fb)
+    ctrl = {"n": 0}
+    robot.subscribeRobotCmd(lambda _c: ctrl.__setitem__("n", ctrl["n"] + 1))
+    time.sleep(1.0)
+    if ctrl["n"] > 0:
+        print("ERROR: the robot's arm controller is commanding the motors ({} commands in 1 s).\n"
+              "Replaying would fight it. Switch the robot to low-level mode first.".format(ctrl["n"]))
+        sys.exit(1)
     deadline = time.monotonic() + 3.0
     while fb.state is None and time.monotonic() < deadline:
         time.sleep(0.05)
@@ -259,7 +295,7 @@ def replay(args):
         print("ERROR: no joint state from the robot.")
         sys.exit(1)
     live_names = fb.state[0]
-    if [live_names[i] for i in sel] != sel_names:
+    if len(live_names) != len(names) or [live_names[i] for i in sel] != sel_names:
         print("ERROR: the robot's motor names differ from the recording.")
         sys.exit(1)
 
@@ -269,19 +305,39 @@ def replay(args):
     ramp_time = max(MIN_RAMP_TIME, max_diff / MAX_RAMP_SPEED)
     print("Current pose is up to {:.2f} rad from the first recorded pose; ramp takes {:.1f} s.".format(
         max_diff, ramp_time))
-    print("Press 's' to start, space to pause, 'q' to quit.")
+    print("Press 's' to start, space to pause, 'q' to quit ('q' twice once the arms are held:\n"
+          "in low-level mode they go limp when commands stop, so support them first).")
 
     cmd = datatypes.RobotCmd()
-    cmd.motor_names = sel_names
-    cmd.parallel_solve_required = [False] * len(sel)
+    n_all = len(live_names)
+    # Unnamed firmware: command all motors in index order, named motor_<i> (the SDK's
+    # publishRobotCmd segfaults on empty names); motors not replayed are held in place.
+    full = n_all == len(TRON2_DEFAULT_KP) and all(n == "motor_{}".format(i) for i, n in enumerate(live_names))
+    sel_pos = {i: k for k, i in enumerate(sel)}
+    rest_q = list(fb.state[1])
+    if full:
+        cmd.motor_names = list(live_names)
+        cmd.parallel_solve_required = [False] * n_all
+    else:
+        cmd.motor_names = sel_names
+        cmd.parallel_solve_required = [False] * len(sel)
 
     def send(q, dq, tau, kp, kd, mode):
         cmd.stamp = time.time_ns()
-        cmd.q, cmd.dq, cmd.tau, cmd.Kp, cmd.Kd = list(q), list(dq), list(tau), list(kp), list(kd)
-        cmd.mode = [int(m) for m in mode]
+        if full:
+            pick_ = lambda vals, other: [vals[sel_pos[i]] if i in sel_pos else other(i) for i in range(n_all)]
+            cmd.q = pick_(q, lambda i: rest_q[i])
+            cmd.dq = pick_(dq, lambda i: 0.0)
+            cmd.tau = pick_(tau, lambda i: 0.0)
+            cmd.Kp = pick_(kp, lambda i: TRON2_DEFAULT_KP[i])
+            cmd.Kd = pick_(kd, lambda i: TRON2_DEFAULT_KD[i])
+            cmd.mode = [int(m) for m in pick_(mode, lambda i: 0)]
+        else:
+            cmd.q, cmd.dq, cmd.tau, cmd.Kp, cmd.Kd = list(q), list(dq), list(tau), list(kp), list(kd)
+            cmd.mode = [int(m) for m in mode]
         return robot.publishRobotCmd(cmd)
 
-    rate = Rate(CMD_HZ)
+    rate = Pacer(CMD_HZ)
     phase = "wait"          # wait -> ramp -> play -> hold
     paused = False
     clock = 0.0             # time inside the current phase (does not advance while paused)
@@ -289,6 +345,8 @@ def replay(args):
     hold = None             # last command sent, repeated while paused / holding
     last = time.monotonic()
     next_display = 0.0
+    release_armed = False
+    note = ""
 
     fd = sys.stdin.fileno()
     old_attrs = termios.tcgetattr(fd)
@@ -296,11 +354,17 @@ def replay(args):
     try:
         while True:
             key = read_key()
+            if key and key != "q":
+                release_armed = False
             if key == "q":
-                break
+                if hold is None or release_armed:
+                    break
+                release_armed, paused = True, True
+                note = "holding: support the arms, then press q again (they go limp)"
             if key == "s" and phase == "wait":
                 phase, clock = "ramp", 0.0
                 start_q = [fb.state[1][i] for i in sel]     # re-read just before moving
+                rest_q = list(fb.state[1])
             elif key == " " and phase in ("ramp", "play"):
                 paused = not paused
 
@@ -350,14 +414,14 @@ def replay(args):
                     err = "{:.3f}".format(max(abs(fb.state[1][i] - c) for i, c in zip(sel, hold[0])))
                 label = "PAUSED" if paused else phase
                 prog = "{:.1f}/{:.1f}s".format(clock, times[-1] - times[0]) if phase == "play" else ""
-                sys.stdout.write("\r\033[K{:6s} {:14s} max tracking error {} rad".format(label, prog, err))
+                sys.stdout.write("\r\033[K{:6s} {:14s} max tracking error {} rad  {}".format(label, prog, err, note))
                 sys.stdout.flush()
     except KeyboardInterrupt:
         pass
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
         sub.close()
-        print("\nStopped publishing joint commands.")
+        print("\nStopped publishing joint commands." if hold is not None else "\nNothing was sent.")
 
 
 def main():

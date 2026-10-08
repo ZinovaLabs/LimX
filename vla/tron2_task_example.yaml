@@ -1,0 +1,36 @@
+# tron2_openpi training task for data collected with vla/collect_vla_data.py and
+# converted with vla/convert_to_lerobot.py.
+# Copy to tron2_openpi/configs/train/tron2_tasks/<task>.yaml, then (in tron2_openpi):
+#   export HF_LEROBOT_HOME=/path/to/datasets
+#   uv run scripts/compute_norm_stats.py --task-config configs/train/tron2_tasks/<task>.yaml
+#   uv run scripts/train_tron2_task.py --task-config configs/train/tron2_tasks/<task>.yaml
+
+name: pi05_tron2_pick_cup
+repo_id: tron2_pick_cup                 # --repo-id given to convert_to_lerobot.py
+
+# Every episode stores its own instruction (collect_vla_data.py --task / key t).
+prompt_from_task: true
+
+weight_loader: gs://openpi-assets/checkpoints/pi05_base/params
+
+num_train_steps: 20000
+save_interval: 5000
+batch_size: 32
+fsdp_devices: 1
+action_horizon: 50
+state_dim: 16                           # [left arm 7, left gripper, right arm 7, right gripper]
+action_dim: 16
+rtc_training_simulated_delay: 10
+
+cam_high_key: observation.images.cam_high
+cam_left_wrist_key: observation.images.cam_left_wrist
+cam_right_wrist_key: observation.images.cam_right_wrist
+state_key: observation.state
+action_key: action
+
+# Joint positions in the robot's own convention, absolute actions.
+adapt_to_pi: false
+use_delta_joint_actions: false
+
+assets_base_dir: ./assets
+checkpoint_base_dir: ./checkpoints

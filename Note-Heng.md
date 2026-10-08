@@ -1,3 +1,43 @@
+Run these from limxsdk-lowlevel/, with the venv active (source ~/limx-venv/bin/activate).
+
+Go home (move the arms to home_pose.json):
+python3 python3/examples/api/example_tron2_arm_go_home.py
+Press s to start, space to pause, q to quit.
+
+Drag-teach:
+python3 python3/examples/api/example_tron2_arm_drag_teach.py --check-only   # model check, sends nothing
+python3 python3/examples/api/example_tron2_arm_drag_teach.py                # soft mode
+In soft mode: space switches soft ↔ hold, r starts / stops recording, p saves home, h goes home, q quits.
+
+Save the current pose as home (sends nothing):
+python3 python3/examples/api/example_tron2_arm_drag_teach.py --save-home
+
+Replay a drag recording:
+python3 python3/examples/api/example_tron2_arm_record_replay.py replay drag_<time>.json --speed 0.5
+
+
+# Drag replay
+Record (in drag-teach, while soft):
+1. Drag the arms to the start pose of your motion.
+2. Press r: the status shows REC 0.0s.
+3. Drag the arms through the motion, slowly.
+4. Press r again to save drag_<date>_<time>.json in limxsdk-lowlevel/. Its name appears in the status line.
+5. Press space (HOLD), support the arms, press q q.
+
+Replay (robot still in low-level mode):
+python3 -X faulthandler python3/examples/api/example_tron2_arm_record_replay.py replay drag_<date>_<time>.json --speed 0.5
+1. It checks the recording (joint speeds below 2 rad/s) and that the robot's controller is silent, then prints how far the arms are from the recording's start pose. Nothing moves yet.
+2. Press s: the arms move slowly (0.2 rad/s, at least 3 s) to the start pose, then replay the motion at the chosen speed (--speed 0.5 is half speed, a good first try).
+3. Space pauses. At the end the arms hold the last pose.
+4. Support the arms, press q q: the first q holds, the second stops (the arms go limp).
+
+Notes:
+- Replay uses the recorded gravity torque and the stiff hold gains, so the arms track the recording firmly. They won't feel soft during replay.
+- Keep your hands near the arms the first time. If a joint stalls or something looks wrong, press space to pause, or hit the e-stop.
+- Ls the folder (ls drag_*.json) to find your recordings.
+
+
+###########
 This repo is LimX's low-level SDK, and its Python wheel can talk to a real Tron2 over the network. I wrote a keyboard teleop script for you at python3/examples/api/example_tron2_keyboard_teleop.py. It compiles and the SDK calls it uses exist in the wheel, but I have no robot here, so it hasn't been run against real hardware.
 
 1. Connect to the real robot

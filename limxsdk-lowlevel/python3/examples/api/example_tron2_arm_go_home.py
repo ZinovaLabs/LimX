@@ -7,8 +7,8 @@ home_pose.json is written by example_tron2_arm_drag_teach.py (--save-home or key
 This firmware reports no motor names, so the pose is stored and sent by motor index
 (motor_0 ... motor_15), in the same order as RobotState / RobotCmd.
 
-What it sends: one RobotCmd for all 16 motors, in the same format as the robot's own
-arm controller (no names, mode 0, dq 0, tau 0), with that controller's gains as
+What it sends: one RobotCmd for all 16 motors in index order, named motor_0 ... motor_15
+(the SDK crashes on unnamed commands), mode 0, dq 0, tau 0, with the arm controller's gains as
 measured on this robot (DEFAULT_KP / DEFAULT_KD). Without a gravity feed-forward the
 arms settle about a degree below the target, which is fine for a home pose.
 
@@ -45,7 +45,6 @@ import threading
 import time
 import tty
 
-import limxsdk.robot.Rate as Rate
 import limxsdk.robot.Robot as Robot
 import limxsdk.robot.RobotType as RobotType
 import limxsdk.datatypes as datatypes
@@ -65,6 +64,25 @@ MIN_TIME = 3.0                 # s
 MAX_TRACKING_ERROR = 0.10      # rad (normal lag at full speed is about 1 deg)
 AT_HOME_TOL = math.radians(2.0)
 COMMAND_CHECK_S = 1.0
+MAX_MOVE_DEG = 30.0            # refuse larger moves unless --max-move is raised
+
+
+class Pacer(object):
+    """Fixed-rate loop timing in plain Python: sleeps at most one period, never blocks
+    longer, and re-synchronises after an overrun (used instead of the SDK's Rate)."""
+
+    def __init__(self, hz):
+        self.period = 1.0 / hz
+        self.next = time.monotonic() + self.period
+
+    def sleep(self):
+        now = time.monotonic()
+        wait = self.next - now
+        if wait > 0:
+            time.sleep(min(wait, self.period))
+            self.next += self.period
+        else:
+            self.next = now + self.period      # overrun: skip ahead instead of catching up
 
 
 class Feedback(object):
@@ -93,6 +111,8 @@ def main():
     parser.add_argument("--ip", default="10.192.1.2")
     parser.add_argument("--home", default="home_pose.json")
     parser.add_argument("--speed", type=float, default=MAX_SPEED, help="max joint speed, rad/s (<= 0.5)")
+    parser.add_argument("--max-move", type=float, default=MAX_MOVE_DEG,
+                        help="refuse if any joint would move more than this many degrees (default %(default)s)")
     args = parser.parse_args()
     if not 0.0 < args.speed <= 0.5:
         parser.error("--speed must be in (0, 0.5]")
@@ -142,18 +162,29 @@ def main():
     print("{:10s} {:>9s} {:>9s} {:>9s}".format("joint", "now deg", "home deg", "move deg"))
     for i, (s, g) in enumerate(zip(start, goal)):
         print("motor_{:<4d} {:+9.1f} {:+9.1f} {:+9.1f}".format(i, math.degrees(s), math.degrees(g), math.degrees(g - s)))
+    if math.degrees(max(diff)) > args.max_move:
+        worst = max(range(len(diff)), key=lambda i: diff[i])
+        print("ERROR: motor_{} would move {:.0f} deg (limit {:.0f}). The saved home may be from another\n"
+              "setup or firmware. Check the table, save a new home (--save-home), or if this move is\n"
+              "really safe pass --max-move {:.0f}.".format(worst, math.degrees(diff[worst]), args.max_move,
+                                                          math.ceil(math.degrees(max(diff)))))
+        sys.exit(1)
     print("Largest move {:.1f} deg, takes {:.1f} s. Press 's' to start, space to pause, 'q' to quit.".format(
         math.degrees(max(diff)), duration))
 
     cmd = datatypes.RobotCmd()
     n = len(goal)
     cmd.mode = [0] * n
+    # Names must be filled in: the SDK's publishRobotCmd segfaults on an empty motor_names
+    # list (verified on the robot, 2026-10-07).
+    cmd.motor_names = ["motor_{}".format(i) for i in range(n)]
+    cmd.parallel_solve_required = [False] * n
     cmd.dq = [0.0] * n
     cmd.tau = [0.0] * n
     cmd.Kp = list(DEFAULT_KP)
     cmd.Kd = list(DEFAULT_KD)
 
-    rate = Rate(CMD_HZ)
+    rate = Pacer(CMD_HZ)
     phase = "wait"            # wait -> move -> hold
     paused = False
     t = 0.0
