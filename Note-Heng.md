@@ -37,6 +37,47 @@ Notes:
 - Ls the folder (ls drag_*.json) to find your recordings.
 
 
+# Data collection
+I've written the VLA (pi0.5) data-collection pipeline in vla/. It records demonstrations in the format LimX's tron2_openpi fine-tunes on. Camera reading reuses tron2_env's methods. It works end to end offline but hasn't run on the real robot yet.
+
+Files
+- vla/collect_vla_data.py: records episodes on the robot PC. It only reads from the robot and never sends commands, so you drive the arms with VR teleop, drag-teach or the keyboard while it runs.
+- vla/tron2_vla_io.py: reads the joint state, the controller's joint targets and the gripper. Cameras come from one of three sources:
+  - --cameras sdk (default): the robot's camera topics through the LimX SDK.
+  - --cameras bridge: tron2_env's Bridge connection.
+  - --cameras realsense: RealSense cameras plugged into your PC, through tron2_env's camera manager.
+- vla/convert_to_lerobot.py: runs inside tron2_openpi and turns the raw episodes into a LeRobot dataset.
+- vla/tron2_task_example.yaml: a training config template.
+- vla/README.md has the full how-to, and the root README.md now points to it.
+
+Data format
+- Each frame has a 16-value state and a 16-value action: [left arm 7, left gripper, right arm 7, right gripper], joint positions in radians, gripper opening 0–1.
+- Three camera images (cam_high, cam_left_wrist, cam_right_wrist), recorded at 30 Hz.
+- Each episode stores its own task instruction.
+- By default the action is the robot controller's joint target when you collected with VR teleop. Otherwise (drag-teach or keyboard) it is the next frame's state.
+
+How to use it
+## 1. record (on the robot PC)
+source ~/limx-venv/bin/activate
+python3 vla/collect_vla_data.py --task "pick up the cup" --cam cam_high --cam cam_left_wrist --cam cam_right_wrist
+##    r start/save success · f save as failure · x discard · t new task · q quit
+
+## 2. convert (in tron2_openpi)
+export HF_LEROBOT_HOME=/path/to/datasets
+uv run python /home/alfredo/Documents/Zinova/LimX/vla/convert_to_lerobot.py --raw .../vla_data/<task> --repo-id tron2_<task> --dry-run
+uv run python /home/alfredo/Documents/Zinova/LimX/vla/convert_to_lerobot.py --raw .../vla_data/<task> --repo-id tron2_<task>
+
+## 3. train: copy the yaml into configs/train/tron2_tasks/, then
+uv run scripts/compute_norm_stats.py --task-config configs/train/tron2_tasks/<task>.yaml
+uv run scripts/train_tron2_task.py --task-config configs/train/tron2_tasks/<task>.yaml
+
+Testing: I ran it end to end against a simulated robot and a stand-in for LeRobot. Recording ran at 30 Hz with no stale frames. The actions came out right for both VR-style and drag-teach data, failure and discarded episodes were handled correctly, and the task text was kept. It has not run on the real robot or with the real LeRobot.
+
+Things to check on the robot
+- Wrist cameras: their topics didn't appear on the robot. tron2_openpi needs all three cameras, so any camera that wasn't recorded is filled with black frames, and the converter prints a warning. Without real wrist images the data isn't useful for training. You can get them through the Bridge (--cameras bridge --bridge-host wss://..., host from LimX) or with RealSense cameras on your PC.
+- Gripper: the robot published no gripper state in our earlier tests. If that's still true, the gripper value is fixed at --gripper-fill (default 0).
+
+
 ###########
 This repo is LimX's low-level SDK, and its Python wheel can talk to a real Tron2 over the network. I wrote a keyboard teleop script for you at python3/examples/api/example_tron2_keyboard_teleop.py. It compiles and the SDK calls it uses exist in the wheel, but I have no robot here, so it hasn't been run against real hardware.
 
