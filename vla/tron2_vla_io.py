@@ -16,7 +16,7 @@ cam_right_wrist, as in tron2_openpi):
 
     sdk        the robot's compressed image topics read through the LimX SDK
                (no extra dependency): head camera /camera/top/color/image_raw/compressed,
-               wrist cameras /camera/left|right/color/image_resized/compressed
+               wrist cameras /camera/left|right/color/image_rect_raw/compressed
     bridge     tron2_env's BridgeObservationProvider (TRON2 Bridge WebSocket)
                needs: pip install -e "tron2_env[bridge]" and the Bridge host
     realsense  tron2_env's MultiCameraManager for RealSense cameras attached to this PC
@@ -43,14 +43,17 @@ LEFT_ARM_MOTORS = list(range(0, 7))
 RIGHT_ARM_MOTORS = list(range(7, 14))
 CAMERA_NAMES = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
-# Robot camera topics: the head camera and one camera per arm end-effector. Wrist topics
-# are listed by tron2_env's Bridge defaults; the raw variant is tried as a fallback.
+# Robot camera topics: the head camera and one camera per arm end-effector. The wrist
+# cameras are advertised on the robot as image_rect_raw; tron2_env's Bridge defaults
+# (image_resized) and the raw variant are tried as fallbacks.
 # The first topic of a camera that delivers an image is used.
 SDK_CAMERA_TOPICS = {
     "cam_high": ["/camera/top/color/image_raw/compressed"],
-    "cam_left_wrist": ["/camera/left/color/image_resized/compressed",
+    "cam_left_wrist": ["/camera/left/color/image_rect_raw/compressed",
+                       "/camera/left/color/image_resized/compressed",
                        "/camera/left/color/image_raw/compressed"],
-    "cam_right_wrist": ["/camera/right/color/image_resized/compressed",
+    "cam_right_wrist": ["/camera/right/color/image_rect_raw/compressed",
+                        "/camera/right/color/image_resized/compressed",
                         "/camera/right/color/image_raw/compressed"],
 }
 
@@ -153,6 +156,7 @@ class SdkCameraSource(CameraSource):
     image becomes the camera's topic, the others are ignored from then on."""
 
     def __init__(self, robot, topics):
+        self.robot = robot
         self.lock = threading.Lock()
         self.frames = {}
         self.topics = {n: [t] if isinstance(t, str) else list(t) for n, t in topics.items()}
@@ -176,6 +180,10 @@ class SdkCameraSource(CameraSource):
     def active_topic(self, name):
         with self.lock:
             return self.active.get(name)
+
+    def published_topics(self):
+        """Topic names that currently have a publisher on the robot (takes up to 3 s)."""
+        return {t["name"] for t in self.robot.get_published_topics()}
 
     def close(self):
         for s in self.subs:

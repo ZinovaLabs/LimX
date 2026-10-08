@@ -46,11 +46,13 @@ Usage:
 import argparse
 import json
 import os
+import queue
 import re
 import select
 import shutil
 import sys
 import termios
+import threading
 import time
 import tty
 
@@ -88,6 +90,7 @@ def check_cameras(camera, cams, seconds):
         time.sleep(0.1)
     elapsed = time.monotonic() - t0
     ok = True
+    published = None
     for c in cams:
         f = camera.latest(c)
         topic = camera.active_topic(c) if hasattr(camera, "active_topic") else None
@@ -95,6 +98,12 @@ def check_cameras(camera, cams, seconds):
             ok = False
             tried = getattr(camera, "topics", {}).get(c)
             print("  {:16s} NO IMAGES{}".format(c, "  (tried {})".format(", ".join(tried)) if tried else ""))
+            if tried and hasattr(camera, "published_topics"):
+                if published is None:
+                    published = camera.published_topics()
+                if not published.intersection(tried):
+                    print("  {:16s} no publisher on the robot for these topics: "
+                          "the camera driver is not running".format(""))
             continue
         size = jpeg_size(f[0])
         print("  {:16s} {:5.1f} Hz  {}  {}".format(
@@ -117,6 +126,79 @@ def read_key():
     if select.select([sys.stdin], [], [], 0)[0]:
         return sys.stdin.read(1)
     return ""
+
+
+class Preview(object):
+    """Small live window with every camera side by side, drawn by its own thread so the
+    recording loop never waits on it. Keys pressed in the window act like terminal keys.
+    Each camera shows its image age and rate (red when stale); the bar is red while recording."""
+
+    TITLE = "Tron2 cameras"
+    HEIGHT = 200                  # pixel height of each camera tile
+
+    def __init__(self, camera, cams, max_age):
+        # opencv-python's Qt warns it ships no fonts; the overlay text does not use them
+        os.environ.setdefault("QT_LOGGING_RULES", "default.warning=false")
+        import cv2
+        import numpy as np
+        self.cv2, self.np = cv2, np
+        self.camera, self.cams, self.max_age = camera, list(cams), max_age
+        self.status, self.recording = "", False
+        self.keys = queue.Queue()
+        self.tiles = {}           # name -> (seq, resized image)
+        self.rate = {c: (time.monotonic(), 0, 0.0) for c in self.cams}   # (t, seq, Hz)
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def key(self):
+        try:
+            return self.keys.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _tile(self, name, frame, now):
+        cv2, np = self.cv2, self.np
+        h = self.HEIGHT
+        cached = self.tiles.get(name)
+        if frame is not None and (cached is None or cached[0] != frame[2]):
+            img = cv2.imdecode(np.frombuffer(frame[0], np.uint8), cv2.IMREAD_COLOR)
+            if img is not None:
+                img = cv2.resize(img, (img.shape[1] * h // img.shape[0], h), interpolation=cv2.INTER_AREA)
+                cached = self.tiles[name] = (frame[2], img)
+        img = cached[1].copy() if cached else np.zeros((h, h * 4 // 3, 3), np.uint8)
+
+        t, seq, hz = self.rate[name]
+        if frame is not None and now - t >= 1.0:
+            hz = (frame[2] - seq) / (now - t) if seq else 0.0
+            self.rate[name] = (now, frame[2], hz)
+        age = None if frame is None else now - frame[1]
+        label = "{}  {}  {:.0f} Hz".format(name.replace("cam_", ""),
+                                           "--" if age is None else "{:.0f} ms".format(age * 1000), hz)
+        color = (0, 0, 255) if age is None or age > self.max_age else (255, 255, 255)
+        cv2.putText(img, label, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(img, label, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        return img
+
+    def _loop(self):
+        cv2, np = self.cv2, self.np
+        cv2.namedWindow(self.TITLE, cv2.WINDOW_AUTOSIZE)
+        while self.running:
+            now = time.monotonic()
+            img = np.hstack([self._tile(c, self.camera.latest(c), now) for c in self.cams])
+            bar = np.full((26, img.shape[1], 3), (0, 0, 200) if self.recording else (60, 60, 60), np.uint8)
+            cv2.putText(bar, self.status, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.imshow(self.TITLE, np.vstack([bar, img]))
+            k = cv2.waitKey(60) & 0xFF
+            if k != 255:
+                self.keys.put(chr(k))
+            if cv2.getWindowProperty(self.TITLE, cv2.WND_PROP_VISIBLE) < 1:
+                break             # window closed: recording goes on without it
+        cv2.destroyAllWindows()
+
+    def close(self):
+        self.running = False
+        self.thread.join(timeout=1.0)
 
 
 class Episode(object):
@@ -188,6 +270,8 @@ def main():
     parser.add_argument("--bridge-path", default="/bridge/ws")
     parser.add_argument("--serial", action="append", default=[], metavar="SERIAL=NAME",
                         help="realsense source: serial number to camera name, e.g. 1234=cam_high")
+    parser.add_argument("--no-preview", action="store_true",
+                        help="do not open the live camera window while collecting")
     parser.add_argument("--gripper-fill", type=float, default=0.0,
                         help="gripper value (0..1) recorded when no gripper state is published")
     args = parser.parse_args()
@@ -244,13 +328,23 @@ def main():
     print("Keys: r start/stop(save)  f stop(failure)  x discard  d d delete last  u undo  "
           "l list  t new task  q quit")
 
+    preview = None
+    if not args.no_preview:
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            print("No camera preview: no display.")
+        else:
+            try:
+                preview = Preview(camera, cams, MAX_IMAGE_AGE_S)
+            except ImportError:
+                print("No camera preview: pip install opencv-python (or use --no-preview).")
+
     fd = sys.stdin.fileno()
     old_attrs = termios.tcgetattr(fd)
     tty.setcbreak(fd)
     next_t = time.monotonic()
     try:
         while True:
-            key = read_key()
+            key = read_key() or (preview.key() if preview else None)
             now = time.monotonic()
             state, cmd, grip = robot.snapshot()
             frames = {c: camera.latest(c) for c in cams}
@@ -363,6 +457,9 @@ def main():
                 rec = ("REC ep{} {:5.1f}s {:4d}f {:4.1f}Hz stale {}".format(
                     episode.index, now - episode.t0, episode.frames, rates["fps"], episode.stale)
                        if episode else "idle, " + tally)
+                if preview:
+                    preview.status = "{} | state {} | {}".format(rec, "ok" if state_ok else "STALE", note)
+                    preview.recording = episode is not None
                 sys.stdout.write("\r\033[K{} | state {} | cam {} | ctrl cmd {} | grip {} | {}".format(
                     rec, "ok" if state_ok else "STALE", cam_str, "yes" if cmd_ok else "no",
                     "ok" if grip is not None else "n/a", note))
@@ -373,9 +470,29 @@ def main():
             episode.finish("incomplete")
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        if preview:
+            preview.close()
         camera.close()
         print("\nDone. Episodes are in {}".format(out_dir))
 
 
 if __name__ == "__main__":
-    main()
+    # The SDK has no way to unsubscribe subscribeRobotState & co., and its native threads
+    # keep calling those callbacks while the interpreter shuts down, which segfaults.
+    # Episode files are closed by then, so leave without the interpreter teardown.
+    code = 0
+    try:
+        main()
+    except SystemExit as e:
+        if isinstance(e.code, int) or e.code is None:
+            code = e.code or 0
+        else:
+            print(e.code, file=sys.stderr)
+            code = 1
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        code = 1
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)

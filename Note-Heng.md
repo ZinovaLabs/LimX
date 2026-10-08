@@ -72,8 +72,23 @@ New keys in the collector (they work between episodes)
 └─────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ## 1. record (on the robot PC)
 source ~/limx-venv/bin/activate
-python3 vla/collect_vla_data.py --task "pick up the cup" --cam cam_high --cam cam_left_wrist --cam cam_right_wrist
-##    r start/save success · f save as failure · x discard · t new task · q quit
+cd ~/Documents/Zinova/LimX
+
+## check the cameras (each one should show a rate and resolution)
+python3 vla/collect_vla_data.py --check
+
+## collect (the preview window opens automatically)
+python3 vla/collect_vla_data.py --task "pick up the cup and place it on the plate"
+
+## Change the --task text to your actual instruction. Keys while collecting:
+##    r start an episode, r again saves it as a success · f save as a failure · x discard the episode · q quit
+
+## Optional:
+## record at 10 Hz to match the left camera until it's fixed
+python3 vla/collect_vla_data.py --task "..." --fps 10
+
+## no preview window
+python3 vla/collect_vla_data.py --task "..." --no-preview
 
 ## 2. convert (in tron2_openpi)
 export HF_LEROBOT_HOME=/path/to/datasets

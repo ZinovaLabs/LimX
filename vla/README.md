@@ -53,12 +53,17 @@ joint targets are present (`ctrl cmd yes` during VR teleop), and the gripper. An
 starts when the joint state and all three cameras are fresh, so every saved frame has a
 head, left-wrist and right-wrist image.
 
+A small window shows all cameras side by side while collecting (needs `pip install
+opencv-python`; `--no-preview` turns it off). Each camera is labelled with its image age and
+rate, in red when stale, and the bar on top turns red while an episode records. The keys
+above also work with the window focused; closing the window does not stop the collector.
+
 Camera sources:
 
 ```
 # robot camera topics through the LimX SDK (default, all three cameras):
 #   head   /camera/top/color/image_raw/compressed
-#   wrists /camera/left|right/color/image_resized/compressed (image_raw tried as fallback)
+#   wrists /camera/left|right/color/image_rect_raw/compressed (image_resized, image_raw tried as fallbacks)
 python3 vla/collect_vla_data.py --task "..."
 # tron2_env Bridge (all three cameras): pip install -e "tron2_env[bridge]"
 python3 vla/collect_vla_data.py --task "..." --cameras bridge --bridge-host wss://<bridge host>
