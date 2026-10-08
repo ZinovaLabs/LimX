@@ -15,8 +15,8 @@ Camera sources, all delivering JPEG bytes per camera name (cam_high, cam_left_wr
 cam_right_wrist, as in tron2_openpi):
 
     sdk        the robot's compressed image topics read through the LimX SDK
-               (no extra dependency; the top camera is on
-               /camera/top/color/image_raw/compressed)
+               (no extra dependency): head camera /camera/top/color/image_raw/compressed,
+               wrist cameras /camera/left|right/color/image_resized/compressed
     bridge     tron2_env's BridgeObservationProvider (TRON2 Bridge WebSocket)
                needs: pip install -e "tron2_env[bridge]" and the Bridge host
     realsense  tron2_env's MultiCameraManager for RealSense cameras attached to this PC
@@ -43,11 +43,15 @@ LEFT_ARM_MOTORS = list(range(0, 7))
 RIGHT_ARM_MOTORS = list(range(7, 14))
 CAMERA_NAMES = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
-# Robot topics, as listed by tron2_env's Bridge defaults.
+# Robot camera topics: the head camera and one camera per arm end-effector. Wrist topics
+# are listed by tron2_env's Bridge defaults; the raw variant is tried as a fallback.
+# The first topic of a camera that delivers an image is used.
 SDK_CAMERA_TOPICS = {
-    "cam_high": "/camera/top/color/image_raw/compressed",
-    "cam_left_wrist": "/camera/left/color/image_resized/compressed",
-    "cam_right_wrist": "/camera/right/color/image_resized/compressed",
+    "cam_high": ["/camera/top/color/image_raw/compressed"],
+    "cam_left_wrist": ["/camera/left/color/image_resized/compressed",
+                       "/camera/left/color/image_raw/compressed"],
+    "cam_right_wrist": ["/camera/right/color/image_resized/compressed",
+                        "/camera/right/color/image_raw/compressed"],
 }
 
 _u32 = struct.Struct("<I").unpack_from
@@ -143,23 +147,35 @@ class CameraSource(object):
 
 
 class SdkCameraSource(CameraSource):
-    """Compressed image topics read with the LimX SDK's generic subscriber."""
+    """Compressed image topics read with the LimX SDK's generic subscriber.
+
+    topics: {name: topic or [candidate topics]}; the first candidate that delivers an
+    image becomes the camera's topic, the others are ignored from then on."""
 
     def __init__(self, robot, topics):
         self.lock = threading.Lock()
         self.frames = {}
-        self.names = tuple(topics)
+        self.topics = {n: [t] if isinstance(t, str) else list(t) for n, t in topics.items()}
+        self.active = {}
+        self.names = tuple(self.topics)
         self.subs = []
-        for name, topic in topics.items():
-            def cb(msg, name=name):
-                with self.lock:
-                    seq = self.frames.get(name, (None, 0, 0))[2] + 1
-                    self.frames[name] = (msg.data, time.monotonic(), seq)
-            self.subs.append(robot.subscribe(CompressedImage, topic, cb))
+        for name, candidates in self.topics.items():
+            for topic in candidates:
+                def cb(msg, name=name, topic=topic):
+                    with self.lock:
+                        if self.active.setdefault(name, topic) != topic:
+                            return
+                        seq = self.frames.get(name, (None, 0, 0))[2] + 1
+                        self.frames[name] = (msg.data, time.monotonic(), seq)
+                self.subs.append(robot.subscribe(CompressedImage, topic, cb))
 
     def latest(self, name):
         with self.lock:
             return self.frames.get(name)
+
+    def active_topic(self, name):
+        with self.lock:
+            return self.active.get(name)
 
     def close(self):
         for s in self.subs:

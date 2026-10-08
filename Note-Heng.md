@@ -38,7 +38,7 @@ Notes:
 
 
 # Data collection
-I've written the VLA (pi0.5) data-collection pipeline in vla/. It records demonstrations in the format LimX's tron2_openpi fine-tunes on. Camera reading reuses tron2_env's methods. It works end to end offline but hasn't run on the real robot yet.
+The VLA (pi0.5) data-collection pipeline in vla/. It records demonstrations in the format LimX's tron2_openpi fine-tunes on. Camera reading reuses tron2_env's methods. It works end to end offline but hasn't run on the real robot yet.
 
 Files
 - vla/collect_vla_data.py: records episodes on the robot PC. It only reads from the robot and never sends commands, so you drive the arms with VR teleop, drag-teach or the keyboard while it runs.

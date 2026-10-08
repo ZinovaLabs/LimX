@@ -203,12 +203,13 @@ python3 python3/examples/api/example_tron2_arm_go_home.py
 
 ## VLA data collection (pi0.5)
 
-Record demonstrations (state, top and wrist cameras, task text) at 30 Hz and convert them
+Record demonstrations (joint state, head camera, both end-effector cameras, task text) at 30 Hz and convert them
 into the LeRobot dataset that LimX's `tron2_openpi` fine-tunes pi0.5 on. The collector only
 reads from the robot, so drive the arms with VR teleop, drag-teach or the keyboard.
 
 ```
 source ~/limx-venv/bin/activate
+python3 vla/collect_vla_data.py --check      # head + both wrist cameras streaming?
 python3 vla/collect_vla_data.py --task "pick up the cup and place it on the plate"
 # r start/save, f failure, x discard, t new task, q quit
 ```

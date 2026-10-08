@@ -16,7 +16,8 @@ access follows LimX's [`tron2_env`](https://github.com/limxdynamics/tron2_env).
 - **state / action**, 16 values: `[left arm 7, left gripper, right arm 7, right gripper]`.
   Arm joints in radians, robot motor order (motor 0-6 left, 7-13 right: shoulder pitch, roll,
   yaw, elbow, wrist yaw, pitch, roll). Gripper = opening 0..1.
-- **cameras**: `cam_high` (top camera), `cam_left_wrist`, `cam_right_wrist`.
+- **cameras**, all three recorded in every frame: `cam_high` (head camera), `cam_left_wrist`
+  and `cam_right_wrist` (the cameras on the left and right end-effectors).
 - **rate**: 30 Hz, the tron2_openpi policy rate.
 - **task**: the natural-language instruction, stored per episode.
 
@@ -27,8 +28,13 @@ Operate the arms however you like (VR teleop, drag-teach, keyboard); the collect
 ```
 source ~/limx-venv/bin/activate
 cd /home/alfredo/Documents/Zinova/LimX
+python3 vla/collect_vla_data.py --check      # all three cameras must show a rate and resolution
 python3 vla/collect_vla_data.py --task "pick up the cup and place it on the plate"
 ```
+
+`--check` prints, per camera, the rate, the resolution and the topic it found, then exits.
+The collector runs the same check at start-up. A camera showing `NO IMAGES` lists the topics
+it tried; give the right one with `--topic cam_left_wrist=/camera/...` (repeat per camera).
 
 | Key | Action |
 |---|---|
@@ -40,13 +46,16 @@ python3 vla/collect_vla_data.py --task "pick up the cup and place it on the plat
 
 The status line shows the state, every camera's image age, whether the robot controller's
 joint targets are present (`ctrl cmd yes` during VR teleop), and the gripper. An episode only
-starts when the joint state and all cameras are fresh.
+starts when the joint state and all three cameras are fresh, so every saved frame has a
+head, left-wrist and right-wrist image.
 
 Camera sources:
 
 ```
-# robot camera topics through the LimX SDK (default; cam_high only unless --cam is repeated)
-python3 vla/collect_vla_data.py --task "..." --cam cam_high --cam cam_left_wrist --cam cam_right_wrist
+# robot camera topics through the LimX SDK (default, all three cameras):
+#   head   /camera/top/color/image_raw/compressed
+#   wrists /camera/left|right/color/image_resized/compressed (image_raw tried as fallback)
+python3 vla/collect_vla_data.py --task "..."
 # tron2_env Bridge (all three cameras): pip install -e "tron2_env[bridge]"
 python3 vla/collect_vla_data.py --task "..." --cameras bridge --bridge-host wss://<bridge host>
 # RealSense cameras on this PC: pip install -e "tron2_env[camera]"
@@ -70,8 +79,8 @@ uv run python /home/alfredo/Documents/Zinova/LimX/vla/convert_to_lerobot.py \
 - `--action auto` (default): actions are the robot controller's joint targets when the episode
   was recorded during VR teleop, otherwise the next frame's state (drag-teach, keyboard).
 - `--raw` can be repeated to merge several tasks into one dataset.
-- Cameras that were not recorded are written as black frames, because tron2_openpi's task
-  config always reads all three keys. Record the wrist cameras for real training data.
+- Every episode must contain all three cameras; otherwise the converter stops with an error.
+  `--allow-missing-cameras` writes black frames instead, for testing the pipeline only.
 
 ## 3. Train (in tron2_openpi)
 
@@ -87,7 +96,8 @@ uv run scripts/train_tron2_task.py --task-config configs/train/tron2_tasks/<task
 
 - Tested offline end to end with a simulated robot and a strict stand-in for LeRobot (shapes,
   dtypes, action derivation, task text); not yet against the real robot or real LeRobot.
-- The wrist-camera topics (`/camera/left|right/...`) did not appear in the robot's topic list;
-  they may only be available through the TRON2 Bridge (ask LimX for the Bridge host).
+- The wrist-camera topics (`/camera/left|right/...`) did not appear in the robot's topic list
+  on 2026-10-07. Run `--check` with the wrist cameras connected; if they still show
+  `NO IMAGES`, use the TRON2 Bridge (`--cameras bridge`, host from LimX).
 - The robot published no gripper state in recent tests; the gripper then reads
   `--gripper-fill` (default 0).

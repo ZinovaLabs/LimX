@@ -23,10 +23,9 @@ Action per frame (--action):
     auto         cmd when at least 95 % of an episode's frames carry a command, else next_state
     Gripper actions always use the next frame's gripper state.
 
-Cameras: tron2_openpi's TRON2 task config always reads cam_high, cam_left_wrist and
-cam_right_wrist, and training fails if a key is missing. Cameras that were not recorded
-are therefore written as black frames (a warning is printed); record the wrist cameras
-for real training data.
+Cameras: tron2_openpi's TRON2 task config reads cam_high (head), cam_left_wrist and
+cam_right_wrist (end-effector cameras). Every episode must contain all three; for a quick
+test without wrist cameras, --allow-missing-cameras writes black frames instead.
 
 Episodes with status other than "success" are skipped unless --include-failed. Episodes with
 more than --max-stale stale frames (old image or joint state) are skipped.
@@ -99,6 +98,8 @@ def main():
                         help="how LeRobot stores images (video needs ffmpeg)")
     parser.add_argument("--size", default="480x640", help="image size HxW stored in the dataset, '' keeps the source")
     parser.add_argument("--include-failed", action="store_true")
+    parser.add_argument("--allow-missing-cameras", action="store_true",
+                        help="write black frames for cameras not recorded (testing only)")
     parser.add_argument("--max-stale", type=float, default=0.05, help="max share of stale frames per episode")
     parser.add_argument("--overwrite", action="store_true", help="replace an existing dataset with this id")
     parser.add_argument("--dry-run", action="store_true", help="check the episodes, write nothing")
@@ -135,8 +136,11 @@ def main():
     cameras = sorted(set.intersection(*(set(m["cameras"]) for _, m, _ in episodes)))
     all_cameras = ["cam_high", "cam_left_wrist", "cam_right_wrist"]
     missing = [c for c in all_cameras if c not in cameras]
-    if "cam_high" not in cameras:
-        print("ERROR: tron2_openpi needs cam_high in every episode; found {}".format(cameras))
+    if missing and (not args.allow_missing_cameras or "cam_high" in missing):
+        print("ERROR: {} missing from some episodes (found in all: {}).\n"
+              "       Record all three cameras (python3 vla/collect_vla_data.py --check);\n"
+              "       --allow-missing-cameras writes black wrist frames for testing.".format(
+                  ", ".join(missing), ", ".join(cameras) or "none"))
         sys.exit(1)
     if not size:
         first = episodes[0][0]
@@ -145,8 +149,7 @@ def main():
     print("\n{} episodes, {} frames, {} Hz, cameras {}, images {}x{}".format(
         len(episodes), sum(len(r) for _, _, r in episodes), fps, cameras, size[0], size[1]))
     if missing:
-        print("WARNING: {} not recorded; written as black frames (tron2_openpi needs all three keys).\n"
-              "         Record the wrist cameras for real training data.".format(", ".join(missing)))
+        print("WARNING: {} not recorded; written as black frames (testing only).".format(", ".join(missing)))
     if args.dry_run:
         return
 
