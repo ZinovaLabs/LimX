@@ -26,7 +26,13 @@ Keys:
     f        stop and save as a failure (kept, skipped by the converter by default)
     x        stop and discard the episode (deletes its folder)
     t        type a new task instruction for the next episodes
+    d d      move the last saved episode to the trash (press d twice)
+    u        undo the last delete
+    l        list the episodes in this folder
     q        quit (an episode in progress is saved as "incomplete")
+
+Deleted episodes go to <out>/.trash/ and can also be managed afterwards with
+vla/manage_episodes.py (list, delete by number, restore, mark failure, edit task).
 
 Usage:
     python3 vla/collect_vla_data.py --check          # are all three cameras streaming?
@@ -52,6 +58,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tron2_vla_io import (CAMERA_NAMES, LAYOUT_NAMES, SDK_CAMERA_TOPICS,  # noqa: E402
                           BridgeCameraSource, RealSenseCameraSource, RobotSource,
                           SdkCameraSource, build_vector)
+from manage_episodes import (describe, list_episodes, list_trash,  # noqa: E402
+                             restore_episode, summary_line, trash_episode)
 
 FORMAT_VERSION = 1
 MAX_STATE_AGE_S = 0.05        # joint state older than this marks the frame stale
@@ -229,9 +237,12 @@ def main():
     episode = None
     period = 1.0 / args.fps
     note = "press r to start episode {}".format(index)
+    tally = summary_line(list_episodes(out_dir)).split(",")[0]
+    delete_armed = 0.0         # time of the first d press; a second d within 3 s deletes
     rates = {"t": time.monotonic(), "n": 0, "fps": 0.0}
     print("Recording to {} at {:.0f} Hz, cameras: {} ({}).".format(out_dir, args.fps, ", ".join(cams), args.cameras))
-    print("Keys: r start/stop(save)  f stop(failure)  x discard  t new task  q quit")
+    print("Keys: r start/stop(save)  f stop(failure)  x discard  d d delete last  u undo  "
+          "l list  t new task  q quit")
 
     fd = sys.stdin.fileno()
     old_attrs = termios.tcgetattr(fd)
@@ -273,6 +284,38 @@ def main():
                 note = "saved {} ({}, {} frames, {} stale)".format(
                     os.path.basename(episode.dir), status, episode.frames, episode.stale)
                 episode, index = None, index + 1
+                tally = summary_line(list_episodes(out_dir)).split(",")[0]
+            elif key == "d" and episode is None:
+                saved = list_episodes(out_dir)
+                if not saved:
+                    note = "no episode to delete"
+                elif now - delete_armed > 3.0:
+                    delete_armed = now
+                    m = saved[-1][2]
+                    note = "press d again to delete episode {} ({}, {} frames)".format(
+                        saved[-1][0], m.get("status", "?"), m.get("frames", "?"))
+                else:
+                    delete_armed = 0.0
+                    trash_episode(saved[-1][1])
+                    index = next_episode_index(out_dir)
+                    note = "episode {} moved to the trash (u to undo)".format(saved[-1][0])
+                    tally = summary_line(list_episodes(out_dir)).split(",")[0]
+            elif key == "u" and episode is None:
+                trash = list_trash(out_dir)
+                if not trash:
+                    note = "nothing to undo"
+                else:
+                    dest = restore_episode(out_dir, trash[-1][1], trash[-1][2])
+                    index = next_episode_index(out_dir)
+                    note = "restored {}".format(os.path.basename(dest))
+                    tally = summary_line(list_episodes(out_dir)).split(",")[0]
+            elif key == "l" and episode is None:
+                saved = list_episodes(out_dir)
+                sys.stdout.write("\r\033[K")
+                for n, _, m in saved[-15:]:
+                    sys.stdout.write(describe(n, m) + "\n")
+                sys.stdout.write(summary_line(saved) + "\n")
+                note = "listed"
             elif key == "x" and episode is not None:
                 episode.discard()
                 note = "discarded episode {}".format(index)
@@ -319,7 +362,7 @@ def main():
                                    for c, a in img_age.items())
                 rec = ("REC ep{} {:5.1f}s {:4d}f {:4.1f}Hz stale {}".format(
                     episode.index, now - episode.t0, episode.frames, rates["fps"], episode.stale)
-                       if episode else "idle")
+                       if episode else "idle, " + tally)
                 sys.stdout.write("\r\033[K{} | state {} | cam {} | ctrl cmd {} | grip {} | {}".format(
                     rec, "ok" if state_ok else "STALE", cam_str, "yes" if cmd_ok else "no",
                     "ok" if grip is not None else "n/a", note))

@@ -211,7 +211,8 @@ reads from the robot, so drive the arms with VR teleop, drag-teach or the keyboa
 source ~/limx-venv/bin/activate
 python3 vla/collect_vla_data.py --check      # head + both wrist cameras streaming?
 python3 vla/collect_vla_data.py --task "pick up the cup and place it on the plate"
-# r start/save, f failure, x discard, t new task, q quit
+# r start/save, f failure, x discard, d d delete last, u undo, l list, t new task, q quit
+python3 vla/manage_episodes.py vla_data/<task>               # list / delete / restore episodes
 ```
 
 Converting and training: see [`vla/README.md`](vla/README.md).

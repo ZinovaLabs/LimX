@@ -7,6 +7,7 @@ access follows LimX's [`tron2_env`](https://github.com/limxdynamics/tron2_env).
 | File | Runs on | Purpose |
 |---|---|---|
 | `collect_vla_data.py` | the PC connected to the robot (`~/limx-venv`) | record episodes, read only |
+| `manage_episodes.py` | anywhere | list, delete, restore, re-label episodes |
 | `tron2_vla_io.py` | (module) | robot state and camera sources |
 | `convert_to_lerobot.py` | the `tron2_openpi` environment | raw episodes → LeRobot dataset |
 | `tron2_task_example.yaml` | `tron2_openpi` | training config template |
@@ -41,6 +42,9 @@ it tried; give the right one with `--topic cam_left_wrist=/camera/...` (repeat p
 | `r` | start an episode; `r` again saves it as a success |
 | `f` | stop, save as a failure (skipped by the converter by default) |
 | `x` | stop and discard the episode |
+| `d` `d` | move the last saved episode to the trash (press `d` twice within 3 s) |
+| `u` | undo the last delete |
+| `l` | list the episodes recorded so far |
 | `t` | type a new task instruction for the next episodes |
 | `q` | quit (an episode in progress is kept as "incomplete") |
 
@@ -64,6 +68,21 @@ python3 vla/collect_vla_data.py --task "..." --cameras realsense --serial <seria
 
 Episodes land in `vla_data/<task>/episode_NNNNNN/` (`meta.json`, `frames.jsonl`, one JPEG per
 camera per frame).
+
+### Managing episodes
+
+Deleted episodes go to `vla_data/<task>/.trash/`, which the converter ignores, so every
+delete can be undone until the trash is emptied.
+
+```
+python3 vla/manage_episodes.py vla_data                      # summary of every task folder
+python3 vla/manage_episodes.py vla_data/<task>               # list episodes
+python3 vla/manage_episodes.py vla_data/<task> delete last   # or: delete 3 5 8-10 / delete failed
+python3 vla/manage_episodes.py vla_data/<task> restore       # undo the last delete (restore all)
+python3 vla/manage_episodes.py vla_data/<task> mark 4 failure
+python3 vla/manage_episodes.py vla_data/<task> task 4 "pick up the red cup"
+python3 vla/manage_episodes.py vla_data/<task> empty-trash   # delete the trash for good
+```
 
 ## 2. Convert (in tron2_openpi)
 

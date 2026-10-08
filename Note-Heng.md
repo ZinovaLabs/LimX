@@ -57,6 +57,19 @@ Data format
 - By default the action is the robot controller's joint target when you collected with VR teleop. Otherwise (drag-teach or keyboard) it is the next frame's state.
 
 How to use it
+New keys in the collector (they work between episodes)
+
+┌─────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Key │                                                 What it does                                                  │
+├─────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ d d │ Deletes the last saved episode. Press d twice within 3 s. The first press shows which episode it will delete. │
+├─────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ u   │ Undoes the last delete.                                                                                       │
+├─────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ l   │ Lists the episodes recorded so far, with status, frame count, length and task.                                │
+├─────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ x   │ Discards the episode you're currently recording (unchanged).                                                  │
+└─────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ## 1. record (on the robot PC)
 source ~/limx-venv/bin/activate
 python3 vla/collect_vla_data.py --task "pick up the cup" --cam cam_high --cam cam_left_wrist --cam cam_right_wrist
