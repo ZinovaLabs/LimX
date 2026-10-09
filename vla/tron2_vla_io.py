@@ -28,15 +28,19 @@ Everything here only reads from the robot.
 import bisect
 import collections
 import io
+import os
 import struct
 import threading
 import time
+import xml.etree.ElementTree as ET
+
+import numpy as np
 
 import limxsdk.robot.Robot as Robot
 import limxsdk.robot.RobotType as RobotType
 import limxsdk.datatypes as datatypes
 from limxsdk.msg import Header
-from limxsdk.msg import controller_msgs
+from limxsdk.msg import controller_msgs, std_msgs
 
 ARM_JOINTS = ["proximal_pitch", "proximal_roll", "proximal_yaw", "elbow",
               "wrist_yaw", "wrist_pitch", "wrist_roll"]
@@ -183,6 +187,12 @@ class Stream(object):
                 return self.samples[i - 1]
             return self.samples[i]
 
+    def since(self, t):
+        """All samples captured after t, oldest first."""
+        with self.lock:
+            i = bisect.bisect_right(self.samples, t, key=lambda s: s[0])
+            return [self.samples[j] for j in range(i, len(self.samples))]
+
     def stats(self, window):
         """(rate Hz, largest capture-to-receive latency s, largest gap between samples s)
         over the last `window` seconds, or None with fewer than two samples."""
@@ -205,7 +215,8 @@ class RobotSource(object):
     """Joint state, robot-controller command and gripper state as time-stamped Streams:
 
         state        (q, dq, tau)
-        cmd          (q, Kp) from the robot's own controller (/motor/cmd)
+        cmd          (q, Kp, raw stamp) from /motor/cmd: the robot's own controller, or our
+                     own go-home commands (home.py tells them apart by the stamp)
         gripper      [left, right] 2F-gripper opening in percent, 0 closed .. 100 open
                      (/limx/2F-gripper/state, ~100 Hz)
         gripper_cmd  [left, right] commanded opening in percent (/limx/2F-gripper/cmd,
@@ -238,7 +249,7 @@ class RobotSource(object):
         self._add("state", s.stamp, (list(s.q), list(s.dq), list(s.tau)))
 
     def _on_cmd(self, c):
-        self._add("cmd", c.stamp, (list(c.q), list(c.Kp)))
+        self._add("cmd", c.stamp, (list(c.q), list(c.Kp), c.stamp))
 
     def _on_gripper(self, g):
         self._add("gripper", g.header.stamp.to_nsec(), list(g.q))
@@ -246,6 +257,92 @@ class RobotSource(object):
     def _on_gripper_cmd(self, c):
         recv = time.monotonic()
         self.streams["gripper_cmd"].add(recv, list(c.opening), recv)
+
+
+URDF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
+                         "limxsdk-lowlevel", "urdf", "DACH_TRON2A.urdf")
+
+
+def _rotation(axis, angle):
+    """Rotation matrix about a unit axis (Rodrigues)."""
+    x, y, z = axis
+    c, s = np.cos(angle), np.sin(angle)
+    k = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
+    return np.eye(3) + s * k + (1 - c) * (k @ k)
+
+
+def _rpy(r, p, y):
+    return _rotation((0, 0, 1), y) @ _rotation((0, 1, 0), p) @ _rotation((1, 0, 0), r)
+
+
+class ArmKinematics(object):
+    """Forward kinematics of both arms from the robot's URDF (limxsdk-lowlevel/urdf).
+
+    positions(q) takes the motor positions (motors 0-6 left arm, 7-13 right arm, in chain
+    order, see the URDF README) and returns the gripper mount (grasper_L_Link /
+    grasper_R_Link) positions in base_Link, metres, shape (2, 3): [left, right]."""
+
+    TIPS = ("grasper_L_Link", "grasper_R_Link")
+
+    def __init__(self, path=URDF_PATH):
+        joints = {}
+        for j in ET.parse(path).getroot().findall("joint"):
+            o, a = j.find("origin"), j.find("axis")
+            xyz = [float(v) for v in (o.get("xyz", "0 0 0") if o is not None else "0 0 0").split()]
+            rpy = [float(v) for v in (o.get("rpy", "0 0 0") if o is not None else "0 0 0").split()]
+            axis = [float(v) for v in a.get("xyz").split()] if a is not None else None
+            joints[j.find("child").get("link")] = (j.find("parent").get("link"), j.get("type"),
+                                                   np.array(xyz), _rpy(*rpy), axis)
+        self.chains = []                 # per arm: [(offset, fixed rotation, axis or None)] base -> tip
+        for tip in self.TIPS:
+            chain, link = [], tip
+            while link in joints:
+                parent, kind, xyz, rot, axis = joints[link]
+                chain.append((xyz, rot, np.array(axis) if kind == "revolute" else None))
+                link = parent
+            chain.reverse()
+            if sum(1 for c in chain if c[2] is not None) != 7:
+                raise ValueError("{}: expected 7 revolute joints to {}".format(path, tip))
+            self.chains.append(chain)
+
+    def positions(self, q):
+        out = np.empty((2, 3))
+        for arm, chain in enumerate(self.chains):
+            angles = iter(q[arm * 7:arm * 7 + 7])
+            pos, rot = np.zeros(3), np.eye(3)
+            for xyz, fixed, axis in chain:
+                pos = pos + rot @ xyz
+                rot = rot @ fixed
+                if axis is not None:
+                    rot = rot @ _rotation(axis, next(angles))
+            out[arm] = pos
+        return out
+
+
+class ArmSource(object):
+    """End-effector wrench of both arms, as the Stream ee_force:
+
+        [left Fx Fy Fz Tx Ty Tz, right Fx Fy Fz Tx Ty Tz] from /dyn_identify/ee_force_kf
+        (~100 Hz), N and N*m. Estimated by the robot (no force sensor; it reads ~20 N at
+        rest, so tare it), and the wire carries no labels: the per-arm force-then-torque
+        layout is assumed.
+
+    The message carries no timestamp, so samples are timed by their receive time. (The
+    controller's /arm_pose end-effector pose is only published in some control modes; use
+    ArmKinematics on the joint state instead.)"""
+
+    def __init__(self, robot):
+        self.streams = {"ee_force": Stream()}
+        self.subs = [robot.subscribe(std_msgs.Float32MultiArray, "/dyn_identify/ee_force_kf", self._on_force)]
+
+    def _on_force(self, msg):
+        if len(msg.data) >= 12:
+            recv = time.monotonic()
+            self.streams["ee_force"].add(recv, list(msg.data[:12]), recv)
+
+    def close(self):
+        for s in self.subs:
+            s.close()
 
 
 # ----------------------------------------------------------------------------- cameras

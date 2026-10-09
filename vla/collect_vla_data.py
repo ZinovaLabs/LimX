@@ -30,14 +30,26 @@ Raw episode layout (convert with vla/convert_to_lerobot.py):
         cam_high/000000.jpg ...
 
 Keys:
-    r        start an episode; r again: stop and save it as a success
-    f        stop and save as a failure (kept, skipped by the converter by default)
+    r        start an episode; r again: stop and save it as a success, then go home
+    f        stop and save as a failure (kept, skipped by the converter by default), then go home
     x        stop and discard the episode (deletes its folder)
     t        type a new task instruction for the next episodes
     d d      move the last saved episode to the trash (press d twice)
     u        undo the last delete
     l        list the episodes in this folder
     q        quit (an episode in progress is saved as "incomplete")
+
+Going home (vla/home.py, --no-home turns it off): the home pose is where the arms are when the
+first episode starts (or --home FILE, e.g. limxsdk-lowlevel/home_pose.json). After each saved
+episode the arms return there slowly (--home-speed rad/s, smooth start and
+stop, stops when a joint is blocked). This sends joint commands, which must not fight the
+robot's own controller: it starts once /motor/cmd goes quiet (switch the robot to SDK
+control mode), holds home, and stops sending as soon as the robot's controller commands
+again (switch back to teleop). The next episode can start once that has happened; r while
+it is still waiting for SDK mode (nothing sent yet) skips going home.
+
+Output: only "EPS n is collecting ...", "EPS n finished" and "EPS n deleted" (plus errors);
+--verbose shows the start-up stream report and a live status line instead.
 
 Deleted episodes go to <out>/.trash/ and can also be managed afterwards with
 vla/manage_episodes.py (list, delete by number, restore, mark failure, edit task).
@@ -68,6 +80,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tron2_vla_io import (CAMERA_NAMES, LAYOUT_NAMES, SDK_CAMERA_TOPICS,  # noqa: E402
                           BridgeCameraSource, RealSenseCameraSource, RobotSource,
                           SdkCameraSource, build_vector)
+from home import HomeMover, load_home  # noqa: E402
 from manage_episodes import (describe, list_episodes, list_trash,  # noqa: E402
                              restore_episode, summary_line, trash_episode)
 
@@ -91,9 +104,9 @@ def jpeg_size(data):
     return None
 
 
-def check_streams(robot, camera, cams, seconds, frequency):
-    """Watch the joint state and every camera for `seconds`; print each one's rate, latency
-    and (cameras) resolution and topic.
+def check_streams(robot, camera, cams, seconds, frequency, echo=print):
+    """Watch the joint state and every camera for `seconds`; report (echo) each one's rate,
+    latency and (cameras) resolution and topic.
 
     Returns (ok, delay, slowest): ok is False when a stream sends nothing or is slower than
     `frequency`; delay is how far behind real time frames must be assembled so that every
@@ -108,13 +121,13 @@ def check_streams(robot, camera, cams, seconds, frequency):
         if stats is None or now - last[3] > 0.5:
             ok, missing = False, True
             tried = getattr(camera, "topics", {}).get(name)
-            print("  {:16s} NO {}{}".format(name, "IMAGES" if name in cams else "JOINT STATE",
+            echo("  {:16s} NO {}{}".format(name, "IMAGES" if name in cams else "JOINT STATE",
                                             "  (tried {})".format(", ".join(tried)) if tried else ""))
             if tried and hasattr(camera, "published_topics"):
                 if published is None:
                     published = camera.published_topics()
                 if not published.intersection(tried):
-                    print("  {:16s} no publisher on the robot for these topics: "
+                    echo("  {:16s} no publisher on the robot for these topics: "
                           "the camera driver is not running".format(""))
             continue
         rate, latency, gap = stats
@@ -127,7 +140,7 @@ def check_streams(robot, camera, cams, seconds, frequency):
             info = "  {}  {}".format("{}x{}".format(*size) if size else "?", topic or "")
         slow = rate < 0.95 * frequency
         ok = ok and not slow
-        print("  {:16s} {:6.1f} Hz  latency {:3.0f} ms{}{}".format(
+        echo("  {:16s} {:6.1f} Hz  latency {:3.0f} ms{}{}".format(
             name, rate, latency * 1000, info, "  SLOWER THAN --frequency {:g}".format(frequency) if slow else ""))
     return ok, min(1.0, max(0.05, delay + 0.02)), None if missing else slowest
 
@@ -141,6 +154,30 @@ def next_episode_index(out_dir):
         return 0
     ids = [int(m.group(1)) for d in os.listdir(out_dir) for m in [re.match(r"episode_(\d+)$", d)] if m]
     return max(ids) + 1 if ids else 0
+
+
+def say(text):
+    """One line of collector output, clear of any status line."""
+    sys.stdout.write("\r\033[K" + text + "\n")
+    sys.stdout.flush()
+
+
+class muted_stdout(object):
+    """Silence everything written to stdout (fd 1), also by native code, e.g. the SDK's
+    'INFO: Tron2 created!' banner."""
+
+    def __enter__(self):
+        sys.stdout.flush()
+        self.saved = os.dup(1)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)
+        os.close(devnull)
+
+    def __exit__(self, *exc):
+        sys.stdout.flush()
+        os.dup2(self.saved, 1)
+        os.close(self.saved)
+        return False
 
 
 def read_key():
@@ -358,6 +395,16 @@ def main():
     parser.add_argument("--bridge-path", default="/bridge/ws")
     parser.add_argument("--serial", action="append", default=[], metavar="SERIAL=NAME",
                         help="realsense source: serial number to camera name, e.g. 1234=cam_high")
+    parser.add_argument("--no-home", action="store_true",
+                        help="do not return the arms home after each episode")
+    parser.add_argument("--home", metavar="JSON",
+                        help="home pose file (default: the pose the arms are in when the first episode starts)")
+    parser.add_argument("--home-speed", type=float, default=0.2, metavar="RAD_S",
+                        help="max joint speed going home, rad/s, at most 0.5 (default %(default)s)")
+    parser.add_argument("--home-max-move", type=float, default=90.0, metavar="DEG",
+                        help="refuse to go home if a joint would move more than this (default %(default)s)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="print the start-up stream report and a live status line")
     parser.add_argument("--no-preview", action="store_true",
                         help="do not open the live camera window while collecting")
     parser.add_argument("--preview-height", type=int, default=200, metavar="PX",
@@ -366,12 +413,18 @@ def main():
                         help="gripper value (0..1, 0 closed) recorded when neither the gripper state "
                              "nor a gripper command has been received")
     args = parser.parse_args()
+    if not 0.0 < args.home_speed <= 0.5:
+        parser.error("--home-speed must be in (0, 0.5]")
     if not args.check and not args.task:
         parser.error("--task is required (or use --check)")
 
     out_dir = args.out or os.path.join("vla_data", slug(args.task or "check"))
 
-    robot = RobotSource(args.ip)
+    if args.verbose or args.check:
+        robot = RobotSource(args.ip)
+    else:
+        with muted_stdout():
+            robot = RobotSource(args.ip)
     if args.cameras == "sdk":
         cams = args.cam or list(CAMERA_NAMES)
         topics = {c: SDK_CAMERA_TOPICS[c] for c in cams}
@@ -398,10 +451,13 @@ def main():
     sources_desc["state"] = ("sdk RobotState (motors 0-13); gripper: /limx/2F-gripper/state opening, "
                              "else last /limx/2F-gripper/cmd opening")
 
-    print("Checking streams ({:.0f} s) ...".format(3.0))
-    streams_ok, delay, slowest = check_streams(robot, camera, cams, 3.0, args.frequency)
+    report = ["Checking streams ({:.0f} s) ...".format(3.0)]
+    streams_ok, delay, slowest = check_streams(robot, camera, cams, 3.0, args.frequency, report.append)
     if slowest:
-        print("  the slowest stream runs at {:.0f} Hz: the highest --frequency to record all of them".format(slowest))
+        report.append("  the slowest stream runs at {:.0f} Hz: the highest --frequency to record all "
+                      "of them".format(slowest))
+    if args.check or args.verbose or not streams_ok:
+        print("\n".join(report))
     if args.check:
         camera.close()
         sys.exit(0 if streams_ok else 1)
@@ -421,15 +477,27 @@ def main():
     tally = summary_line(list_episodes(out_dir)).split(",")[0]
     delete_armed = 0.0         # time of the first d press; a second d within 3 s deletes
     rates = {"t": time.monotonic(), "n": 0, "fps": 0.0}
-    print("Recording to {} at {:g} Hz, cameras: {} ({}); frames assembled {:.0f} ms behind real time.".format(
+    log = print if args.verbose else (lambda *a, **k: None)
+    log("Recording to {} at {:g} Hz, cameras: {} ({}); frames assembled {:.0f} ms behind real time.".format(
         out_dir, args.frequency, ", ".join(cams), args.cameras, delay * 1000))
-    print("Keys: r start/stop(save)  f stop(failure)  x discard  d d delete last  u undo  "
+    log("Keys: r start/stop(save)  f stop(failure)  x discard  d d delete last  u undo  "
           "l list  t new task  q quit")
+
+    homer = None
+    if not args.no_home:
+        try:
+            homer = HomeMover(robot, load_home(args.home) if args.home else None,
+                              args.home_speed, args.home_max_move)
+            log("Going home after each episode at {:g} rad/s to {}.".format(
+                args.home_speed, os.path.relpath(args.home) if args.home else
+                "the pose the arms are in when the first episode starts"))
+        except (OSError, ValueError, KeyError) as e:
+            print("No going home: {} (or use --no-home).".format(e))
 
     preview = None
     if not args.no_preview:
         if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-            print("No camera preview: no display.")
+            log("No camera preview: no display.")
         else:
             try:
                 preview = Preview(camera, cams, MAX_IMAGE_AGE_S, args.preview_height)
@@ -477,48 +545,67 @@ def main():
                     stop(episode)
                     episode.finish("incomplete")
                     note = "saved {} as incomplete".format(os.path.basename(episode.dir))
+                    say("EPS {} finished".format(episode.index))
                 break
+            elif key == "r" and episode is None and homer is not None and homer.busy \
+                    and homer.phase_name != "waiting":
+                note = "wait: the arms are going home (switch back to teleop when they hold)"
+                say("EPS {} cannot start yet: {}".format(index, note))
             elif key == "r" and episode is None:
+                if homer is not None and homer.busy:      # still waiting for SDK mode: skip going home
+                    homer.cancel()
                 if not (state_ok and imgs_ok):
                     note = "cannot start: {} not fresh".format("joint state" if not state_ok else
                                                                "camera " + ", ".join(c for c, a in img_age.items()
                                                                                      if a is None or a > MAX_IMAGE_AGE_S))
+                    say("EPS {} {}".format(index, note))
                 else:
                     if hasattr(camera, "active_topic"):
                         sources_desc["active_topics"] = {c: camera.active_topic(c) for c in cams}
+                    if homer is not None and homer.goal is None:
+                        homer.set_goal(state[2][0])          # home = where the arms start episode 1
                     episode = Episode(out_dir, index, task, args.frequency, cams, sources_desc, align)
                     note = "RECORDING episode {}".format(index)
+                    say("EPS {} is collecting ...".format(index))
             elif key in ("r", "f") and episode is not None:
                 status = "success" if key == "r" else "failure"
                 stop(episode)
                 episode.finish(status)
+                if homer is not None:
+                    homer.start()
                 note = "saved {} ({}, {} frames, {} stale)".format(
                     os.path.basename(episode.dir), status, episode.frames, episode.stale)
+                say("EPS {} finished{}".format(index, "" if status == "success" else " (failure)"))
                 episode, index = None, index + 1
                 tally = summary_line(list_episodes(out_dir)).split(",")[0]
             elif key == "d" and episode is None:
                 saved = list_episodes(out_dir)
                 if not saved:
                     note = "no episode to delete"
+                    say(note)
                 elif now - delete_armed > 3.0:
                     delete_armed = now
                     m = saved[-1][2]
                     note = "press d again to delete episode {} ({}, {} frames)".format(
                         saved[-1][0], m.get("status", "?"), m.get("frames", "?"))
+                    say("press d again to delete EPS {}".format(saved[-1][0]))
                 else:
                     delete_armed = 0.0
                     trash_episode(saved[-1][1])
                     index = next_episode_index(out_dir)
                     note = "episode {} moved to the trash (u to undo)".format(saved[-1][0])
+                    say("EPS {} deleted".format(saved[-1][0]))
                     tally = summary_line(list_episodes(out_dir)).split(",")[0]
             elif key == "u" and episode is None:
                 trash = list_trash(out_dir)
                 if not trash:
                     note = "nothing to undo"
+                    say(note)
                 else:
                     dest = restore_episode(out_dir, trash[-1][1], trash[-1][2])
                     index = next_episode_index(out_dir)
                     note = "restored {}".format(os.path.basename(dest))
+                    say("EPS {} restored".format(int(os.path.basename(dest).split("_")[1])))
                     tally = summary_line(list_episodes(out_dir)).split(",")[0]
             elif key == "l" and episode is None:
                 saved = list_episodes(out_dir)
@@ -530,6 +617,7 @@ def main():
             elif key == "x" and episode is not None:
                 episode.discard()
                 note = "discarded episode {}".format(index)
+                say("EPS {} deleted".format(index))
                 episode = None
             elif key == "t" and episode is None:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
@@ -555,24 +643,31 @@ def main():
                     episode.index, now - episode.t0, episode.frames, rates["fps"], rates["sync"], episode.stale)
                        if episode else "idle, " + tally)
                 rates["sync"] = 0.0
+                shown = note
+                if homer is not None and homer.phase_name != "idle":
+                    shown = homer.status()
                 if preview:
-                    preview.status = "{} | state {} | {}".format(rec, "ok" if state_ok else "STALE", note)
+                    preview.status = "{} | state {} | {}".format(rec, "ok" if state_ok else "STALE", shown)
                     preview.recording = episode is not None
-                sys.stdout.write("\r\033[K{} | state {} | cam {} | ctrl cmd {} | grip {} | {}".format(
-                    rec, "ok" if state_ok else "STALE", cam_str, "yes" if cmd_ok else "no",
-                    "{:.0f}/{:.0f}%".format(*grip[2][:2]) if grip is not None else "n/a", note))
-                sys.stdout.flush()
+                if args.verbose:
+                    sys.stdout.write("\r\033[K{} | state {} | cam {} | ctrl cmd {} | grip {} | {}".format(
+                        rec, "ok" if state_ok else "STALE", cam_str, "yes" if cmd_ok else "no",
+                        "{:.0f}/{:.0f}%".format(*grip[2][:2]) if grip is not None else "n/a", shown))
+                    sys.stdout.flush()
             time.sleep(0.002)
     except KeyboardInterrupt:
         if episode:
             stop(episode)
             episode.finish("incomplete")
+            say("EPS {} finished".format(episode.index))
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        if homer is not None:
+            homer.close()
         if preview:
             preview.close()
         camera.close()
-        print("\nDone. Episodes are in {}".format(out_dir))
+        log("\nDone. Episodes are in {}".format(out_dir))
 
 
 if __name__ == "__main__":

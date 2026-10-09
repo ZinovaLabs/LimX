@@ -7,8 +7,9 @@ access follows LimX's [`tron2_env`](https://github.com/limxdynamics/tron2_env).
 | File | Runs on | Purpose |
 |---|---|---|
 | `collect_vla_data.py` | the PC connected to the robot (`~/limx-venv`) | record episodes, read only |
+| `dashboard.py` | the PC connected to the robot | live window: cameras, end-effector position, contact force |
 | `manage_episodes.py` | anywhere | list, delete, restore, re-label episodes |
-| `tron2_vla_io.py` | (module) | robot state and camera sources |
+| `tron2_vla_io.py` | (module) | robot state, camera and force sources, arm kinematics |
 | `convert_to_lerobot.py` | the `tron2_openpi` environment | raw episodes → LeRobot dataset |
 | `tron2_task_example.yaml` | `tron2_openpi` | training config template |
 
@@ -81,7 +82,24 @@ until that is fixed; `--cam cam_high --cam cam_right_wrist` records the other tw
 | `t` | type a new task instruction for the next episodes |
 | `q` | quit (an episode in progress is kept as "incomplete") |
 
-The status line shows the recording rate, the worst `sync_ms` of the last 0.2 s, the state,
+**Going home after each episode.** The home pose is where the arms are when you start the
+first episode (`--home FILE` uses a saved pose instead, e.g.
+`limxsdk-lowlevel/home_pose.json`; `--no-home` turns this off). After every `r` (save) or `f`,
+the arms return there slowly (`--home-speed`, default 0.2 rad/s, smooth start and stop; a
+blocked joint stops the move). Going home sends joint commands, which must not fight the
+robot's own controller, so:
+
+1. press `r`: the episode is saved and the status shows `HOME: switch the robot to SDK control mode`;
+2. switch the robot to SDK control mode: as soon as `/motor/cmd` goes quiet the arms move home and hold;
+3. switch back to teleop: the collector stops sending at once, and the next `r` starts an episode.
+
+While the collector is still waiting for SDK mode (nothing sent yet), `r` skips going home and
+starts the next episode; once the arms move or hold, `r` waits until teleop is back.
+
+The terminal only prints `EPS n is collecting ...`, `EPS n finished` and `EPS n deleted` (plus
+errors). Numbers follow the saved episodes: after deleting the last one, the next episode reuses
+its number. With `--verbose`, the start-up stream report and a live status line are printed too:
+the status line shows the recording rate, the worst `sync_ms` of the last 0.2 s, the state,
 every camera's image age, whether the robot controller's
 joint targets are present (`ctrl cmd yes` during VR teleop), and the gripper. An episode only
 starts when the joint state and all three cameras are fresh, so every saved frame has a
@@ -108,6 +126,27 @@ python3 vla/collect_vla_data.py --task "..." --cameras realsense --serial <seria
 
 Episodes land in `vla_data/<task>/episode_NNNNNN/` (`meta.json`, `frames.jsonl`, one JPEG per
 camera per frame).
+
+### Live dashboard
+
+```
+pip install pyqtgraph PyQt6            # once; PyQt6 also needs: sudo apt install libxcb-cursor0
+python3 vla/dashboard.py               # --window 5|10|30, --cam ... to show fewer cameras
+```
+
+A dark, resizable window, read only, so it runs alone or next to the collector:
+
+- **cameras**: all three, each with its rate and image age (yellow under 25 Hz, red when stale).
+- **per arm**: the gripper-mount position X/Y/Z in mm as large readouts (robot base frame,
+  computed from the joint angles with `limxsdk-lowlevel/urdf/DACH_TRON2A.urdf`; the
+  controller's own `/arm_pose` is only published in some control modes), the change of
+  X/Y/Z since the reference as curves (Δ mm), and the contact force Fx/Fy/Fz and |F| in N.
+- **force**: the robot's estimate on `/dyn_identify/ee_force_kf` (no force sensor). It reads
+  ~20 N with nothing touching, so press **Tare force** with the arms free. The topic carries
+  no labels; `[left Fx Fy Fz Tx Ty Tz, right ...]` is assumed: push on one gripper to check.
+
+Keys: `space` pause, `r` reset the Δ reference, `t` tare the force, `1`/`2`/`3` show 5/10/30 s,
+`q` quit.
 
 ### Managing episodes
 

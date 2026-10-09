@@ -83,6 +83,20 @@ python3 vla/collect_vla_data.py --task "pick up the cup and place it on the plat
 ## Change the --task text to your actual instruction. Keys while collecting:
 ##    r start an episode, r again saves it as a success · f save as a failure · x discard the episode · q quit
 
+How to discard an episode:
+
+┌──────────────┬─────────────────┬────────────────────────────────────────────────┐
+│     When     │       Key       │                  What happens                  │
+├──────────────┼─────────────────┼────────────────────────────────────────────────┤
+│ while        │ x               │ stops and deletes the current episode          │
+│ recording    │                 │                                                │
+├──────────────┼─────────────────┼────────────────────────────────────────────────┤
+│ after it's   │ d then d again  │ moves the last saved episode to the trash      │
+│ saved        │ within 3 s      │ (vla_data/<task>/.trash/)                      │
+├──────────────┼─────────────────┼────────────────────────────────────────────────┤
+│ after d d    │ u               │ undoes the last delete                         │
+└──────────────┴─────────────────┴────────────────────────────────────────────────┘
+
 ## Optional:
 ## record at 10 Hz to match the left camera until it's fixed
 python3 vla/collect_vla_data.py --task "..." --fps 10
