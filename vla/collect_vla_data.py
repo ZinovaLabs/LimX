@@ -30,9 +30,10 @@ Raw episode layout (convert with vla/convert_to_lerobot.py):
         cam_high/000000.jpg ...
 
 Keys:
-    r        start an episode; r again: stop and save it as a success, then go home
-    f        stop and save as a failure (kept, skipped by the converter by default), then go home
-    x        stop and discard the episode (deletes its folder)
+    r        start an episode; r again: stop recording and ask for its label
+    1 / 2    label the stopped episode success / failure (failures are kept, skipped by the
+             converter by default); only then is it saved and the arms go home
+    x        stop and discard the episode (deletes its folder), also while it awaits its label
     t        type a new task instruction for the next episodes
     d d      move the last saved episode to the trash (press d twice)
     u        undo the last delete
@@ -48,7 +49,8 @@ control mode), holds home, and stops sending as soon as the robot's controller c
 again (switch back to teleop). The next episode can start once that has happened; r while
 it is still waiting for SDK mode (nothing sent yet) skips going home.
 
-Output: only "EPS n is collecting ...", "EPS n finished" and "EPS n deleted" (plus errors);
+Output: only "EPS n is collecting ...", the label prompt, "EPS n finished" and "EPS n deleted"
+(plus errors);
 --verbose shows the start-up stream report and a live status line instead.
 
 Deleted episodes go to <out>/.trash/ and can also be managed afterwards with
@@ -473,6 +475,7 @@ def main():
     task = args.task
     index = next_episode_index(out_dir)
     episode = None
+    labeling = False           # episode stopped, waiting for 1 (success) / 2 (failure)
     note = "press r to start episode {}".format(index)
     tally = summary_line(list_episodes(out_dir)).split(",")[0]
     delete_armed = 0.0         # time of the first d press; a second d within 3 s deletes
@@ -480,7 +483,7 @@ def main():
     log = print if args.verbose else (lambda *a, **k: None)
     log("Recording to {} at {:g} Hz, cameras: {} ({}); frames assembled {:.0f} ms behind real time.".format(
         out_dir, args.frequency, ", ".join(cams), args.cameras, delay * 1000))
-    log("Keys: r start/stop(save)  f stop(failure)  x discard  d d delete last  u undo  "
+    log("Keys: r start/stop  1 success  2 failure  x discard  d d delete last  u undo  "
           "l list  t new task  q quit")
 
     homer = None
@@ -542,7 +545,8 @@ def main():
 
             if key == "q":
                 if episode:
-                    stop(episode)
+                    if not labeling:
+                        stop(episode)
                     episode.finish("incomplete")
                     note = "saved {} as incomplete".format(os.path.basename(episode.dir))
                     say("EPS {} finished".format(episode.index))
@@ -567,10 +571,15 @@ def main():
                     episode = Episode(out_dir, index, task, args.frequency, cams, sources_desc, align)
                     note = "RECORDING episode {}".format(index)
                     say("EPS {} is collecting ...".format(index))
-            elif key in ("r", "f") and episode is not None:
-                status = "success" if key == "r" else "failure"
+            elif key == "r" and episode is not None and not labeling:
                 stop(episode)
+                labeling = True
+                note = "EPS {} stopped: press 1 = SUCCESS or 2 = FAILED (x discards)".format(index)
+                say(note)
+            elif key in ("1", "2") and labeling:
+                status = "success" if key == "1" else "failure"
                 episode.finish(status)
+                labeling = False
                 if homer is not None:
                     homer.start()
                 note = "saved {} ({}, {} frames, {} stale)".format(
@@ -618,7 +627,7 @@ def main():
                 episode.discard()
                 note = "discarded episode {}".format(index)
                 say("EPS {} deleted".format(index))
-                episode = None
+                episode, labeling = None, False
             elif key == "t" and episode is None:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
                 sys.stdout.write("\nNew task instruction: ")
@@ -630,7 +639,7 @@ def main():
                 note = "task: {}".format(task)
 
             # record every frame whose samples have all arrived (frame time + delay has passed)
-            if episode is not None:
+            if episode is not None and not labeling:
                 record_until(episode, now - delay)
 
             # status line, 5 Hz
@@ -639,16 +648,20 @@ def main():
                 rates["t"], rates["n"] = now, 0
                 cam_str = " ".join("{}:{}".format(c.replace("cam_", ""), "--" if a is None else "{:.0f}ms".format(a * 1000))
                                    for c, a in img_age.items())
-                rec = ("REC ep{} {:5.1f}s {:4d}f {:4.1f}Hz sync {:2.0f}ms stale {}".format(
-                    episode.index, now - episode.t0, episode.frames, rates["fps"], rates["sync"], episode.stale)
-                       if episode else "idle, " + tally)
+                if labeling:
+                    rec = "ep{} stopped, {}f".format(episode.index, episode.frames)
+                elif episode:
+                    rec = "REC ep{} {:5.1f}s {:4d}f {:4.1f}Hz sync {:2.0f}ms stale {}".format(
+                        episode.index, now - episode.t0, episode.frames, rates["fps"], rates["sync"], episode.stale)
+                else:
+                    rec = "idle, " + tally
                 rates["sync"] = 0.0
                 shown = note
-                if homer is not None and homer.phase_name != "idle":
+                if homer is not None and homer.phase_name != "idle" and not labeling:
                     shown = homer.status()
                 if preview:
                     preview.status = "{} | state {} | {}".format(rec, "ok" if state_ok else "STALE", shown)
-                    preview.recording = episode is not None
+                    preview.recording = episode is not None and not labeling
                 if args.verbose:
                     sys.stdout.write("\r\033[K{} | state {} | cam {} | ctrl cmd {} | grip {} | {}".format(
                         rec, "ok" if state_ok else "STALE", cam_str, "yes" if cmd_ok else "no",
@@ -657,7 +670,8 @@ def main():
             time.sleep(0.002)
     except KeyboardInterrupt:
         if episode:
-            stop(episode)
+            if not labeling:
+                stop(episode)
             episode.finish("incomplete")
             say("EPS {} finished".format(episode.index))
     finally:

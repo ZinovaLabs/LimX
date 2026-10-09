@@ -73,9 +73,9 @@ until that is fixed; `--cam cam_high --cam cam_right_wrist` records the other tw
 
 | Key | Action |
 |---|---|
-| `r` | start an episode; `r` again saves it as a success |
-| `f` | stop, save as a failure (skipped by the converter by default) |
-| `x` | stop and discard the episode |
+| `r` | start an episode; `r` again stops it and asks for its label |
+| `1` / `2` | label the stopped episode success / failure (failures are skipped by the converter by default); only then is it saved |
+| `x` | stop and discard the episode (also while it waits for its label) |
 | `d` `d` | move the last saved episode to the trash (press `d` twice within 3 s) |
 | `u` | undo the last delete |
 | `l` | list the episodes recorded so far |
@@ -84,8 +84,8 @@ until that is fixed; `--cam cam_high --cam cam_right_wrist` records the other tw
 
 **Going home after each episode.** The home pose is where the arms are when you start the
 first episode (`--home FILE` uses a saved pose instead, e.g.
-`limxsdk-lowlevel/home_pose.json`; `--no-home` turns this off). After every `r` (save) or `f`,
-the arms return there slowly (`--home-speed`, default 0.2 rad/s, smooth start and stop; a
+`limxsdk-lowlevel/home_pose.json`; `--no-home` turns this off). After every labelled episode
+(`1` or `2`), the arms return there slowly (`--home-speed`, default 0.2 rad/s, smooth start and stop; a
 blocked joint stops the move). Going home sends joint commands, which must not fight the
 robot's own controller, so:
 
