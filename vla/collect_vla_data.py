@@ -49,7 +49,7 @@ control mode), holds home, and stops sending as soon as the robot's controller c
 again (switch back to teleop). The next episode can start once that has happened; r while
 it is still waiting for SDK mode (nothing sent yet) skips going home.
 
-Output: only "EPS n is collecting ...", the label prompt, "EPS n finished" and "EPS n deleted"
+Output: only "EPS n is collecting ...", the label prompt, "EPS n finished with Success|Failed" and "EPS n deleted"
 (plus errors);
 --verbose shows the start-up stream report and a live status line instead.
 
@@ -476,7 +476,7 @@ def main():
     index = next_episode_index(out_dir)
     episode = None
     labeling = False           # episode stopped, waiting for 1 (success) / 2 (failure)
-    note = "press r to start episode {}".format(index)
+    note = "press r to start episode {}, r again to finish it".format(index)
     tally = summary_line(list_episodes(out_dir)).split(",")[0]
     delete_armed = 0.0         # time of the first d press; a second d within 3 s deletes
     rates = {"t": time.monotonic(), "n": 0, "fps": 0.0}
@@ -511,6 +511,7 @@ def main():
     old_attrs = termios.tcgetattr(fd)
     tty.setcbreak(fd)
     rates["sync"] = 0.0
+    say("Press r to start an episode, r again to finish it.")
 
     def record_until(ep, until):
         """Record every frame of `ep` whose time is <= until."""
@@ -549,7 +550,7 @@ def main():
                         stop(episode)
                     episode.finish("incomplete")
                     note = "saved {} as incomplete".format(os.path.basename(episode.dir))
-                    say("EPS {} finished".format(episode.index))
+                    say("EPS {} finished with Incomplete".format(episode.index))
                 break
             elif key == "r" and episode is None and homer is not None and homer.busy \
                     and homer.phase_name != "waiting":
@@ -584,7 +585,7 @@ def main():
                     homer.start()
                 note = "saved {} ({}, {} frames, {} stale)".format(
                     os.path.basename(episode.dir), status, episode.frames, episode.stale)
-                say("EPS {} finished{}".format(index, "" if status == "success" else " (failure)"))
+                say("EPS {} finished with {}".format(index, "Success" if status == "success" else "Failed"))
                 episode, index = None, index + 1
                 tally = summary_line(list_episodes(out_dir)).split(",")[0]
             elif key == "d" and episode is None:
@@ -673,7 +674,7 @@ def main():
             if not labeling:
                 stop(episode)
             episode.finish("incomplete")
-            say("EPS {} finished".format(episode.index))
+            say("EPS {} finished with Incomplete".format(episode.index))
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
         if homer is not None:
