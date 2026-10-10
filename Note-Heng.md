@@ -106,12 +106,89 @@ python3 vla/collect_vla_data.py --task "..." --no-preview
 
 ## 2. convert (in tron2_openpi)
 export HF_LEROBOT_HOME=/path/to/datasets
-uv run python /home/alfredo/Documents/Zinova/LimX/vla/convert_to_lerobot.py --raw .../vla_data/<task> --repo-id tron2_<task> --dry-run
-uv run python /home/alfredo/Documents/Zinova/LimX/vla/convert_to_lerobot.py --raw .../vla_data/<task> --repo-id tron2_<task>
+cd ~/Documents/Zinova/tron2_openpi
+unset VIRTUAL_ENV            # your limx-venv is active; uv ignores it but prints a warning
+export HF_LEROBOT_HOME=~/Documents/Zinova/lerobot_datasets
+D=/home/alfredo/Documents/Zinova/LimX
+uv run python $D/vla/convert_to_lerobot.py \
+  --raw $D/vla_data/drive_four_nails_evenly_into_the_blue_strip \
+  --repo-id tron2_drive_four_nails
 
 ## 3. train: copy the yaml into configs/train/tron2_tasks/, then
 uv run scripts/compute_norm_stats.py --task-config configs/train/tron2_tasks/<task>.yaml
 uv run scripts/train_tron2_task.py --task-config configs/train/tron2_tasks/<task>.yaml
+
+Training runs inside tron2_openpi on the GPU machine, in three steps: write a task config, compute normalization stats, then train.
+
+0. One-time setup on the GPU machine
+
+cd ~/tron2_openpi                        # wherever you cloned it there
+GIT_LFS_SKIP_SMUDGE=1 uv sync            # as in its INSTALL.md
+sudo apt install ffmpeg tmux
+export HF_LEROBOT_HOME=~/lerobot_datasets    # where you rsynced the datasets; add to ~/.bashrc
+ls $HF_LEROBOT_HOME                      # should list tron2_drive_four_nails etc.
+
+1. Create the task config
+
+Create configs/train/tron2_tasks/drive_four_nails.yaml:
+
+name: pi05_tron2_drive_four_nails          # checkpoint folder name
+repo_id: tron2_drive_four_nails            # must match the dataset folder name
+prompt_from_task: true                     # use the instruction stored per episode
+weight_loader: gs://openpi-assets/checkpoints/pi05_base/params
+
+num_train_steps: 20000
+save_interval: 5000
+batch_size: 32
+fsdp_devices: 1
+action_horizon: 50
+state_dim: 16
+action_dim: 16
+rtc_training_simulated_delay: 10
+
+cam_high_key: observation.images.cam_high
+cam_left_wrist_key: observation.images.cam_left_wrist
+cam_right_wrist_key: observation.images.cam_right_wrist
+state_key: observation.state
+action_key: action
+
+adapt_to_pi: false
+use_delta_joint_actions: false
+assets_base_dir: ./assets
+checkpoint_base_dir: ./checkpoints
+
+Don't add a prompt: line. The loader rejects it when prompt_from_task: true, and it also rejects any field it doesn't know.
+
+2. Compute normalization stats (once per dataset)
+
+uv run scripts/compute_norm_stats.py --task-config configs/train/tron2_tasks/drive_four_nails.yaml
+
+This writes to assets/pi05_tron2_drive_four_nails/tron2_drive_four_nails/. Training and the deployed policy both need it.
+
+3. Train (inside tmux, so it survives SSH disconnects)
+
+tmux new -s train
+export HF_LEROBOT_HOME=~/lerobot_datasets
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95     # let JAX use nearly all of the 48 GB
+uv run scripts/train_tron2_task.py --task-config configs/train/tron2_tasks/drive_four_nails.yaml
+# detach: Ctrl-b d     reattach: tmux attach -t train
+
+- First run downloads the pi0.5 base weights from gs://openpi-assets (several GB), so the machine needs internet access.
+- Weights & Biases: logging is on by default. Run uv run wandb login first, or add --no-wandb-enabled.
+- Restart: --overwrite starts over, and --resume continues from the last checkpoint.
+- Output: checkpoints are saved to checkpoints/pi05_tron2_drive_four_nails/pi05_tron2_drive_four_nails/<step>/ every 5000 steps.
+- Monitoring: run watch -n 2 nvidia-smi in another pane.
+
+The A6000 has 48 GB, which may not be enough
+
+This config does a full fine-tune of pi0.5. The task YAML has no LoRA option, and upstream openpi says full fine-tuning needs more than 70 GB of GPU memory. Batch 32 will very likely run out of memory on the A6000.
+
+1. Try a smaller batch first. If you get an out-of-memory error, set batch_size: 8 (or 4) and rerun. With a smaller batch you may want more steps, for example num_train_steps: 30000.
+2. If batch 4 still runs out of memory, the model weights and optimizer state alone don't fit. You then need either LoRA fine-tuning, which openpi supports at about 22.5 GB, or a GPU with 80 GB.
+
+tron2_openpi's task loader has no LoRA option, so I'd have to add one, for example a lora: true field. If option 1 fails, I can do that.
+
+Training both tasks: to train the other dataset, copy the YAML, change name and repo_id to tron2_nail_the_white_dots_on_the_black_board, then repeat steps 2 and 3. One GPU runs one job at a time.
 
 Testing: I ran it end to end against a simulated robot and a stand-in for LeRobot. Recording ran at 30 Hz with no stale frames. The actions came out right for both VR-style and drag-teach data, failure and discarded episodes were handled correctly, and the task text was kept. It has not run on the real robot or with the real LeRobot.
 

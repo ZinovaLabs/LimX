@@ -154,7 +154,13 @@ def main():
         return
 
     # ---- write the LeRobot dataset (LeRobot version pinned by tron2_openpi)
-    from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME, LeRobotDataset
+    import inspect
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+    try:
+        from lerobot.common.constants import HF_LEROBOT_HOME as LEROBOT_HOME   # lerobot >= v2.1
+    except ImportError:
+        from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
+    task_in_frame = "task" not in inspect.signature(LeRobotDataset.save_episode).parameters
     target = LEROBOT_HOME / args.repo_id
     if target.exists():
         if not args.overwrite:
@@ -181,8 +187,13 @@ def main():
                     os.path.join(ep_dir, cam, "{:06d}.jpg".format(r["i"])), size)
             for cam in missing:
                 frame["observation.images." + cam] = black
+            if task_in_frame:
+                frame["task"] = meta["task"]
             dataset.add_frame(frame)
-        dataset.save_episode(task=meta["task"])
+        if task_in_frame:
+            dataset.save_episode()
+        else:
+            dataset.save_episode(task=meta["task"])
         print("wrote {} ({} frames, action from {})".format(ep_dir, len(rows), used))
     if hasattr(dataset, "consolidate"):
         dataset.consolidate()
